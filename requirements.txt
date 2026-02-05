@@ -1,0 +1,18 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+opencv-python>=4.9.0.80
+diffusers>=0.31.0
+transformers>=4.49.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio
+easydict
+ftfy
+dashscope
+imageio-ffmpeg
+flash_attn
+gradio>=5.0.0
+numpy>=1.23.5,<2
