@@ -1,6 +1,8 @@
-accelerate launch examples/wanvideo/model_training/train.py \
-  --dataset_base_path data/example_video_dataset \
-  --dataset_metadata_path data/example_video_dataset/metadata.csv \
+accelerate launch --num_processes 1 examples/wanvideo/model_training/train.py \
+  --dataset_base_path /project/bamboofan/Adobe240/frame/train \
+  --dataset_metadata_path /project/bamboofan/Adobe240/frame/train/metadata_1.jsonl \
+  --space_scale 4 \
+  --time_scale 8 \
   --height 480 \
   --width 832 \
   --dataset_repeat 100 \
@@ -9,4 +11,6 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --num_epochs 2 \
   --remove_prefix_in_ckpt "pipe.dit." \
   --output_path "./models/train/Wan2.1-T2V-1.3B_full" \
-  --trainable_models "dit"
+  --trainable_models "dit" \
+  --use_gradient_checkpointing \
+  

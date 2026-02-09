@@ -218,3 +218,132 @@ class LoadAudio(DataProcessingOperator):
         import librosa
         input_audio, sample_rate = librosa.load(data, sr=self.sr)
         return input_audio
+
+
+class LoadVideoClip(DataProcessingOperator):
+    def __init__(self, k=9, start=0, frame_processor=lambda x: x, strict=True):
+        self.k = int(k)
+        self.start = int(start)
+        self.frame_processor = frame_processor
+        self.strict = strict
+
+    def __call__(self, video_path: str):
+        reader = imageio.get_reader(video_path)
+
+        try:
+            n = int(reader.count_frames())
+        except Exception:
+            n = None
+
+        # 嚴格模式：不足 k 直接炸，方便你早期抓資料/metadata 的 bug
+        if self.strict and (n is not None) and (self.start + self.k > n):
+            reader.close()
+            raise ValueError(
+                f"[LoadVideoClip] not enough frames: path={video_path}, "
+                f"count={n}, start={self.start}, k={self.k}"
+            )
+
+        frames = []
+        # 非嚴格：能讀多少讀多少（通常不建議 training 用）
+        max_len = self.k if (n is None or self.strict) else max(0, min(self.k, n - self.start))
+
+        for i in range(max_len):
+            fid = self.start + i
+            try:
+                frame = reader.get_data(fid)
+            except Exception:
+                if self.strict:
+                    reader.close()
+                    raise
+                else:
+                    break
+            frame = Image.fromarray(frame)
+            frame = self.frame_processor(frame)
+            frames.append(frame)
+
+        reader.close()
+        return frames
+
+
+class LoadClip(DataProcessingOperator):
+    def __init__(
+        self,
+        base_path="",
+        default_k=9,
+        frame_processor=lambda x: x,
+        strict=True,
+        video_key="video",
+        frames_key="frames",
+        start_key="start",
+        k_key="k",
+    ):
+        self.base_path = base_path
+        self.default_k = int(default_k)
+        self.frame_processor = frame_processor
+        self.strict = strict
+        self.video_key = video_key
+        self.frames_key = frames_key
+        self.start_key = start_key
+        self.k_key = k_key
+
+    def __call__(self, meta: dict):
+        # Case 1: frames list（通常已經是 clip 長度=k 的 list[str]）
+        if self.frames_key in meta and meta[self.frames_key] is not None:
+            frames = meta[self.frames_key]
+
+            # 如果你 CSV 讀進來還是字串（JSON list），這裡順便支援一下
+            if isinstance(frames, str):
+                import json
+                frames = json.loads(frames)
+
+            if not isinstance(frames, list):
+                raise ValueError(f"[LoadClip] frames must be list/JSON-str, got {type(frames)}")
+
+            abs_frames = [ToAbsolutePath(self.base_path)(p) for p in frames]
+            return SequencialProcess(
+                LoadImage() >> self.frame_processor
+            )(abs_frames)
+
+        # Case 2: video + start + k
+        if self.video_key in meta and meta[self.video_key] is not None:
+            video = ToAbsolutePath(self.base_path)(meta[self.video_key])
+            start = int(meta.get(self.start_key, 0))
+            k = int(meta.get(self.k_key, self.default_k))
+            return LoadVideoClip(k=k, start=start, frame_processor=self.frame_processor, strict=self.strict)(video)
+
+        raise ValueError(f"[LoadClip] meta must contain '{self.frames_key}' or '{self.video_key}'. meta={meta}")
+
+
+class DownsampleVideo(DataProcessingOperator):
+    def __init__(self, space_scale=4, time_scale=8, downsample_indexes=(0, 1, -2, -1)):
+        self.space_scale = int(space_scale)
+        self.time_scale = int(time_scale)
+        self.downsample_indexes = list(downsample_indexes)
+
+    def __call__(self, frames):
+        # frames: list[PIL.Image]
+        n = len(frames)
+        if n == 0:
+            return []
+
+        # 把 index 正規化到 [0, n-1]，並過濾越界
+        idxs = []
+        for i in self.downsample_indexes:
+            j = i if i >= 0 else n + i
+            if 0 <= j < n:
+                idxs.append(j)
+
+        # 可選：去重但保持順序（避免 1 張 frame 時 0/ -1 都指到同一張）
+        seen = set()
+        idxs = [x for x in idxs if not (x in seen or seen.add(x))]
+
+        downsampled_frames = []
+        for j in idxs:
+            frame = frames[j]
+            w, h = frame.size
+            new_w = max(1, w // self.space_scale)
+            new_h = max(1, h // self.space_scale)
+            downsampled_frames.append(
+                frame.resize((new_w, new_h), resample=Image.BICUBIC)
+            )
+        return downsampled_frames

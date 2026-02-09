@@ -1,7 +1,7 @@
 import torch, os, argparse, accelerate, warnings
-from diffsynth.core import UnifiedDataset, STVSRDataset
+from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig, WanVideoUnit_ImageEmbedderFused
+from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -80,11 +80,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
-            "input_video": data["GT"],
-            "LQ_video": data["LQ"],
-            "height": data["GT"][0].size[1],
-            "width": data["GT"][0].size[0],
-            "num_frames": len(data["GT"]),
+            "input_video": data["video"],
+            "height": data["video"][0].size[1],
+            "width": data["video"][0].size[0],
+            "num_frames": len(data["video"]),
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -103,14 +102,8 @@ class WanTrainingModule(DiffusionTrainingModule):
     def forward(self, data, inputs=None):
         if inputs is None: inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
-        # print(self.pipe.units)
         for unit in self.pipe.units:
-            # print(unit)
-            if isinstance(unit, WanVideoUnit_ImageEmbedderFused):
-                print(unit.take_over)
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        # print("[DBG] input keys after pipe:", inputs[0].keys())
-        # print("[DBG] after forward inputs video shape:", inputs[0]["latents"].shape)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
 
@@ -134,22 +127,21 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = STVSRDataset(
+    dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
-        space_scale=args.space_scale,
-        time_scale=args.time_scale,
-        main_data_operator=STVSRDataset.load_clip_operators(
+        main_data_operator=UnifiedDataset.default_video_operator(
             base_path=args.dataset_base_path,
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
             height_division_factor=16,
             width_division_factor=16,
-            # time_division_factor=4,
-            # time_division_remainder=1,
+            num_frames=args.num_frames,
+            time_division_factor=4,
+            time_division_remainder=1,
         ),
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),

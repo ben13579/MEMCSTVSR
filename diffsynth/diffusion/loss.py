@@ -3,6 +3,7 @@ import torch
 
 
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
+    # print("[DBG] inputs video shape:", inputs["input_latents"].shape)
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 

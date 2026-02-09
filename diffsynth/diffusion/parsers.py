@@ -6,7 +6,12 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
-    parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
+    parser.add_argument("--data_file_keys", type=str, default="image,video,frames", help="Data file keys in the metadata. Comma-separated.")
+    return parser
+
+def add_stvsr_dataset_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--space_scale", type=int, default=4, help="Space scale for STVSR dataset, e.g., 4x. If provided, this will override the height and width config.")
+    parser.add_argument("--time_scale", type=int, default=8, help="Time scale for STVSR dataset, e.g., 4x. If provided, this will override the num_frames config.")
     return parser
 
 def add_image_size_config(parser: argparse.ArgumentParser):
@@ -62,6 +67,7 @@ def add_gradient_config(parser: argparse.ArgumentParser):
 
 def add_general_config(parser: argparse.ArgumentParser):
     parser = add_dataset_base_config(parser)
+    parser = add_stvsr_dataset_config(parser)
     parser = add_model_config(parser)
     parser = add_training_config(parser)
     parser = add_output_config(parser)

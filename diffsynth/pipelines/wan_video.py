@@ -57,7 +57,8 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_NoiseInitializer(),
             WanVideoUnit_PromptEmbedder(),
             WanVideoUnit_S2V(),
-            WanVideoUnit_InputVideoEmbedder(),
+            # WanVideoUnit_InputVideoEmbedder(),
+            WanVideoUnit_InputVideoEmbedderForSTVSR(),
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
@@ -312,14 +313,7 @@ class WanVideoPipeline(BasePipeline):
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
-        
-        # VACE (TODO: remove it)
-        if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
-            if vace_reference_image is not None and isinstance(vace_reference_image, list):
-                f = len(vace_reference_image)
-            else:
-                f = 1
-            inputs_shared["latents"] = inputs_shared["latents"][:, :, f:]
+
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -395,6 +389,45 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
             return {"latents": latents}
 
 
+
+class WanVideoUnit_InputVideoEmbedderForSTVSR(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("input_video", "LQ_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image"),
+            output_params=("latents", "input_latents", "LQ_latents","first_frame_latents"),
+            onload_model_names=("vae",)
+        )
+
+    def process(self, pipe: WanVideoPipeline, input_video, LQ_video, noise, tiled, tile_size, tile_stride, vace_reference_image):
+        if input_video is None:
+            return {"latents": noise}
+        pipe.load_models_to_device(self.onload_model_names)
+        input_video = pipe.preprocess_video(input_video)
+        input_latents = pipe.vae.encode(input_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+        first_frame_latents = input_latents[:, :, 0:1].clone()
+        
+        if LQ_video is not None:
+            LQ_video = pipe.preprocess_video(LQ_video)
+            print(LQ_video.shape, input_video.shape)
+            # each lq_video frame encodes to one latent
+            for i in range(LQ_video.shape[2]):
+                LQ_latent = pipe.vae.encode(LQ_video[:, :, i:i+1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+                if i == 0:
+                    LQ_latents = LQ_latent
+                else:                     
+                    LQ_latents = torch.concat((LQ_latents, LQ_latent), dim=2)
+            # LQ_latents = pipe.vae.encode(LQ_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+        if vace_reference_image is not None:
+            if not isinstance(vace_reference_image, list):
+                vace_reference_image = [vace_reference_image]
+            vace_reference_image = pipe.preprocess_video(vace_reference_image)
+            vace_reference_latents = pipe.vae.encode(vace_reference_image, device=pipe.device).to(dtype=pipe.torch_dtype, device=pipe.device)
+            input_latents = torch.concat([vace_reference_latents, input_latents], dim=2)
+        if pipe.scheduler.training:
+            return {"latents": noise, "input_latents": input_latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "first_frame_latents": first_frame_latents}
+        else:
+            latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
+            return {"latents": latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "first_frame_latents": first_frame_latents}
 
 class WanVideoUnit_PromptEmbedder(PipelineUnit):
     def __init__(self):
@@ -1131,6 +1164,7 @@ def model_fn_wan_video(
     vap: MotWanModel = None,
     animate_adapter: WanAnimateAdapter = None,
     latents: torch.Tensor = None,
+    LQ_latents: torch.Tensor = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
@@ -1218,6 +1252,10 @@ def model_fn_wan_video(
         from xfuser.core.distributed import (get_sequence_parallel_rank,
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
+
+    print("Model function called with latents shape:", latents.shape)
+    print("LQ_latents shape:", LQ_latents.shape if LQ_latents is not None else None)
+    exit()
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
