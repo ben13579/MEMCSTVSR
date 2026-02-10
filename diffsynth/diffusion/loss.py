@@ -13,18 +13,25 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     noise = torch.randn_like(inputs["input_latents"])
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
+    print(f"[DBG] timestep_id: {timestep_id}, timestep: {timestep}, latents shape: {inputs['latents'].shape}, training_target shape: {training_target.shape}")
     
-    if "first_frame_latents" in inputs:
-        inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+    if "HQ_latents" in inputs:
+        inputs["latents"] = torch.concat([inputs["HQ_latents"][:, :, 0:1], inputs["latents"]], dim=2)
+
+    # if "first_frame_latents" in inputs:
+    #     inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
     
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
     
-    if "first_frame_latents" in inputs:
+    # if "first_frame_latents" in inputs:
+    #     noise_pred = noise_pred[:, :, 1:]
+    #     training_target = training_target[:, :, 1:]
+    if "HQ_latents" in inputs:
         noise_pred = noise_pred[:, :, 1:]
-        training_target = training_target[:, :, 1:]
     
-    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    # loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    loss = charbonnier_loss(noise_pred.float(), training_target.float())
     loss = loss * pipe.scheduler.training_weight(timestep)
     return loss
 
@@ -125,3 +132,16 @@ class TrajectoryImitationLoss(torch.nn.Module):
         loss_2 = self.compute_regularization(pipe, trajectory_teacher, inputs_shared, inputs_posi, inputs_nega, 8, 1)
         loss = loss_1 + loss_2
         return loss
+
+def charbonnier_loss(pred, target, epsilon=1e-3, reduction='mean'):
+    diff = pred - target
+    loss = torch.sqrt(diff * diff + epsilon * epsilon)
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    elif reduction == 'none':
+        return loss
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")

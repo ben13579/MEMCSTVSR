@@ -16,7 +16,7 @@ from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
-from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d, precompute_freqs_cis
 from ..models.wan_video_dit_s2v import rope_precompute
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
@@ -82,6 +82,8 @@ class WanVideoPipeline(BasePipeline):
         ]
         self.model_fn = model_fn_wan_video
 
+        self.rope_mode = "3d"
+
 
     def enable_usp(self):
         from ..utils.xfuser import get_sequence_parallel_world_size, usp_attn_forward, usp_dit_forward
@@ -107,6 +109,7 @@ class WanVideoPipeline(BasePipeline):
         redirect_common_files: bool = True,
         use_usp: bool = False,
         vram_limit: float = None,
+        rope_mode: str = "3d",
     ):
         # Redirect model path
         if redirect_common_files:
@@ -172,6 +175,9 @@ class WanVideoPipeline(BasePipeline):
         
         # VRAM Management
         pipe.vram_management_enabled = pipe.check_vram_management_state()
+
+        # ROPE precompute
+        pipe.rope_mode = rope_mode
         return pipe
 
 
@@ -394,7 +400,7 @@ class WanVideoUnit_InputVideoEmbedderForSTVSR(PipelineUnit):
     def __init__(self):
         super().__init__(
             input_params=("input_video", "LQ_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image"),
-            output_params=("latents", "input_latents", "LQ_latents","first_frame_latents"),
+            output_params=("latents", "input_latents", "LQ_latents","HQ_latents"),
             onload_model_names=("vae",)
         )
 
@@ -404,11 +410,11 @@ class WanVideoUnit_InputVideoEmbedderForSTVSR(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         input_video = pipe.preprocess_video(input_video)
         input_latents = pipe.vae.encode(input_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-        first_frame_latents = input_latents[:, :, 0:1].clone()
+        HQ_latents = pipe.vae.encode(input_video[:, :, 0:1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         
         if LQ_video is not None:
             LQ_video = pipe.preprocess_video(LQ_video)
-            print(LQ_video.shape, input_video.shape)
+            # print(LQ_video.shape, input_video.shape)
             # each lq_video frame encodes to one latent
             for i in range(LQ_video.shape[2]):
                 LQ_latent = pipe.vae.encode(LQ_video[:, :, i:i+1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
@@ -424,10 +430,10 @@ class WanVideoUnit_InputVideoEmbedderForSTVSR(PipelineUnit):
             vace_reference_latents = pipe.vae.encode(vace_reference_image, device=pipe.device).to(dtype=pipe.torch_dtype, device=pipe.device)
             input_latents = torch.concat([vace_reference_latents, input_latents], dim=2)
         if pipe.scheduler.training:
-            return {"latents": noise, "input_latents": input_latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "first_frame_latents": first_frame_latents}
+            return {"latents": noise, "input_latents": input_latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "HQ_latents": HQ_latents}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
-            return {"latents": latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "first_frame_latents": first_frame_latents}
+            return {"latents": latents, "LQ_latents": LQ_latents if LQ_video is not None else None, "HQ_latents": HQ_latents}
 
 class WanVideoUnit_PromptEmbedder(PipelineUnit):
     def __init__(self):
@@ -1157,6 +1163,167 @@ class TemporalTiler_BCTHW:
 
 
 
+def build_mixed_grid_sizes(main_grid, lq_grid, batch_size, device):
+    main_f, main_h, main_w = main_grid
+    lq_f, lq_h, lq_w = lq_grid
+    main_start = torch.tensor([0, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_end = torch.tensor([main_f, main_h, main_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    lq_start = torch.tensor([main_f, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    lq_end = torch.tensor([main_f + lq_f, lq_h, lq_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    lq_size = torch.tensor([lq_f, lq_h, lq_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    return [
+        [main_start, main_end, main_end],
+        [lq_start, lq_end, lq_size],
+    ]
+
+
+def compute_mixed_rope(x_tokens, grid_sizes, freqs, num_heads, dim):
+    if isinstance(freqs, (list, tuple)):
+        freqs = torch.cat([f for f in freqs], dim=1)
+    rope = rope_precompute(
+        x_tokens.detach().view(x_tokens.size(0), x_tokens.size(1), num_heads, dim // num_heads),
+        grid_sizes,
+        freqs,
+        start=None
+    )
+    return rope[0]
+
+
+def build_mixed_grid_sizes_4d(main_grid, lq_grid, batch_size, device, rope_segment_stride=1):
+    # 4th axis encodes segment id (g index), not sample id.
+    main_f, main_h, main_w = main_grid
+    lq_f, lq_h, lq_w = lq_grid
+    main_start = torch.cat([
+        torch.zeros((batch_size, 3), dtype=torch.long, device=device),
+        torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+    ], dim=1)
+    main_end = torch.cat([
+        torch.tensor([main_f, main_h, main_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1),
+        torch.ones((batch_size, 1), dtype=torch.long, device=device)
+    ], dim=1)
+    main_size = torch.tensor([main_f, main_h, main_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+
+    lq_start = torch.cat([
+        torch.tensor([main_f, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1),
+        torch.ones((batch_size, 1), dtype=torch.long, device=device) * rope_segment_stride
+    ], dim=1)
+    lq_end = torch.cat([
+        torch.tensor([main_f + lq_f, lq_h, lq_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1),
+        torch.ones((batch_size, 1), dtype=torch.long, device=device) * (rope_segment_stride + 1)
+    ], dim=1)
+    lq_size = torch.tensor([lq_f, lq_h, lq_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    return [
+        [main_start, main_end, main_size],
+        [lq_start, lq_end, lq_size],
+    ]
+
+
+def build_freqs_4d(freqs, max_segment_pos, c, device):
+    if not isinstance(freqs, (tuple, list)) or len(freqs) != 3:
+        raise TypeError(
+            f"4D RoPE expects freqs as a 3-tuple/list (f, h, w), got {type(freqs)} with length "
+            f"{len(freqs) if isinstance(freqs, (tuple, list)) else 'N/A'}."
+        )
+    split_sizes = [1, c - 2 * (c // 3) - 1, c // 3, c // 3]
+    if split_sizes[1] <= 0:
+        raise ValueError(f"Invalid 4D RoPE split sizes for c={c}: {split_sizes}.")
+
+    freq_f_src, freq_h_src, freq_w_src = freqs
+    freq_b = precompute_freqs_cis(dim=2).to(freq_f_src.device)
+    freq_f = freq_f_src[:, :split_sizes[1]]
+    freq_h = freq_h_src[:, :split_sizes[2]]
+    freq_w = freq_w_src[:, :split_sizes[3]]
+    freqs_4d = torch.cat([freq_b, freq_f, freq_h, freq_w], dim=1).to(device=device)
+    assert freqs_4d.shape[1] == c, f"4D RoPE freq dim mismatch: expected {c}, got {freqs_4d.shape[1]}"
+    return freqs_4d
+
+
+def rope_precompute_4d(x, grid_sizes, freqs, start=None):
+    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+    if isinstance(freqs, (list, tuple)):
+        freqs = torch.cat([f for f in freqs], dim=1)
+    split_sizes = [1, c - 2 * (c // 3) - 1, c // 3, c // 3]
+    if split_sizes[1] <= 0:
+        raise ValueError(f"Invalid 4D RoPE split sizes: {split_sizes}.")
+    assert sum(split_sizes) == freqs.shape[1], (
+        f"4D RoPE split mismatch: split_sizes={split_sizes} sum={sum(split_sizes)} "
+        f"freq_dim={freqs.shape[1]} c={c}"
+    )
+    freqs = freqs.split(split_sizes, dim=1)
+
+    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    seq_bucket = [0]
+    if not isinstance(grid_sizes, list):
+        grid_sizes = [grid_sizes]
+    for g in grid_sizes:
+        if not isinstance(g, list):
+            g = [torch.zeros_like(g), g]
+        batch_size = g[0].shape[0]
+        seg_seq_len = None
+        for i in range(batch_size):
+            if start is None:
+                f_o, h_o, w_o, b_o = g[0][i]
+            else:
+                f_o, h_o, w_o, b_o = start[i]
+
+            f, h, w, b_idx = g[1][i]
+            t_f, t_h, t_w, t_b = g[2][i]
+            seq_f = int((f - f_o).item())
+            seq_h = int((h - h_o).item())
+            seq_w = int((w - w_o).item())
+            seq_b = int((b_idx - b_o).item())
+            seq_len = seq_f * seq_h * seq_w * seq_b
+            if seg_seq_len is None:
+                seg_seq_len = seq_len
+            elif seg_seq_len != seq_len:
+                raise ValueError("Inconsistent seq_len across batch in 4D RoPE segment.")
+
+            if seq_len > 0:
+                if min(seq_f, seq_h, seq_w, seq_b) <= 0:
+                    raise ValueError("Invalid 4D RoPE grid sizes with non-positive sequence axis.")
+
+                b_sam = np.linspace(b_o.item(), (t_b + b_o).item() - 1, seq_b).astype(int).tolist()
+                if f_o >= 0:
+                    f_sam = np.linspace(f_o.item(), (t_f + f_o).item() - 1, seq_f).astype(int).tolist()
+                else:
+                    f_sam = np.linspace(-f_o.item(), (-t_f - f_o).item() + 1, seq_f).astype(int).tolist()
+                h_sam = np.linspace(h_o.item(), (t_h + h_o).item() - 1, seq_h).astype(int).tolist()
+                w_sam = np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w).astype(int).tolist()
+
+                if max(b_sam) >= freqs[0].shape[0] or min(b_sam) < 0:
+                    raise ValueError(f"Batch-axis RoPE index out of range: {b_sam}.")
+                if max(f_sam) >= freqs[1].shape[0] or min(f_sam) < 0:
+                    raise ValueError(f"F-axis RoPE index out of range: {f_sam}.")
+                if max(h_sam) >= freqs[2].shape[0] or min(h_sam) < 0:
+                    raise ValueError(f"H-axis RoPE index out of range: {h_sam}.")
+                if max(w_sam) >= freqs[3].shape[0] or min(w_sam) < 0:
+                    raise ValueError(f"W-axis RoPE index out of range: {w_sam}.")
+
+                freqs_b = freqs[0][b_sam].view(seq_b, 1, 1, 1, -1)
+                freqs_f = freqs[1][f_sam].view(1, seq_f, 1, 1, -1)
+                freqs_h = freqs[2][h_sam].view(1, 1, seq_h, 1, -1)
+                freqs_w = freqs[3][w_sam].view(1, 1, 1, seq_w, -1)
+                freqs_i = torch.cat([
+                    freqs_b.expand(seq_b, seq_f, seq_h, seq_w, -1),
+                    freqs_f.expand(seq_b, seq_f, seq_h, seq_w, -1),
+                    freqs_h.expand(seq_b, seq_f, seq_h, seq_w, -1),
+                    freqs_w.expand(seq_b, seq_f, seq_h, seq_w, -1),
+                ], dim=-1).reshape(seq_len, 1, -1)
+                output[i, seq_bucket[-1]:seq_bucket[-1] + seq_len] = freqs_i
+        seq_bucket.append(seq_bucket[-1] + (seg_seq_len if seg_seq_len is not None else 0))
+    return output
+
+
+def compute_mixed_rope_4d(x_tokens, grid_sizes, freqs, num_heads, dim):
+    rope = rope_precompute_4d(
+        x_tokens.detach().view(x_tokens.size(0), x_tokens.size(1), num_heads, dim // num_heads),
+        grid_sizes,
+        freqs,
+        start=None
+    )
+    return rope[0]
+
+
 def model_fn_wan_video(
     dit: WanModel,
     motion_controller: WanMotionControllerModel = None,
@@ -1192,6 +1359,8 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    rope_mode: str = "3d",
+    rope_segment_stride: int = 1,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1200,6 +1369,7 @@ def model_fn_wan_video(
             motion_controller=motion_controller,
             vace=vace,
             latents=latents,
+            LQ_latents=LQ_latents,
             timestep=timestep,
             context=context,
             clip_feature=clip_feature,
@@ -1210,13 +1380,15 @@ def model_fn_wan_video(
             tea_cache=tea_cache,
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
+            rope_mode=rope_mode,
+            rope_segment_stride=rope_segment_stride,
         )
         return TemporalTiler_BCTHW().run(
             model_fn_wan_video,
             sliding_window_size, sliding_window_stride,
             latents.device, latents.dtype,
             model_kwargs=model_kwargs,
-            tensor_names=["latents", "y"],
+            tensor_names=["latents", "LQ_latents", "y"],
             batch_size=2 if cfg_merge else 1
         )
     # LongCat-Video
@@ -1253,10 +1425,6 @@ def model_fn_wan_video(
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
 
-    print("Model function called with latents shape:", latents.shape)
-    print("LQ_latents shape:", LQ_latents.shape if LQ_latents is not None else None)
-    exit()
-
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
         timestep = torch.concat([
@@ -1282,6 +1450,10 @@ def model_fn_wan_video(
     # Merged cfg
     if x.shape[0] != context.shape[0]:
         x = torch.concat([x] * context.shape[0], dim=0)
+    if LQ_latents is not None and LQ_latents.shape[0] != x.shape[0]:
+        if x.shape[0] % LQ_latents.shape[0] != 0:
+            raise ValueError(f"LQ_latents batch size ({LQ_latents.shape[0]}) is not compatible with latent batch size ({x.shape[0]}).")
+        LQ_latents = torch.concat([LQ_latents] * (x.shape[0] // LQ_latents.shape[0]), dim=0)
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
 
@@ -1310,12 +1482,44 @@ def model_fn_wan_video(
         reference_latents = dit.ref_conv(reference_latents).flatten(2).transpose(1, 2)
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
-    
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+    seq_len_main = x.shape[1]
+    use_lq_stream = LQ_latents is not None
+    if use_lq_stream:
+        if rope_mode not in ("3d", "4d"):
+            raise ValueError(f"Unsupported rope_mode: {rope_mode}. Expected '3d' or '4d'.")
+        if rope_segment_stride <= 0:
+            raise ValueError(f"rope_segment_stride must be positive, got {rope_segment_stride}.")
+        if LQ_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"LQ_latents channel size ({LQ_latents.shape[1]}) must match latent channels ({latents.shape[1]}) for shared patch embedding."
+            )
+        x_lq = dit.patchify(LQ_latents)
+        f_lq, h_lq, w_lq = x_lq.shape[2:]
+        x_lq = rearrange(x_lq, 'b c f h w -> b (f h w) c').contiguous()
+        x = torch.concat([x, x_lq], dim=1)
+        if rope_mode == "3d":
+            mixed_grid_sizes = build_mixed_grid_sizes((f, h, w), (f_lq, h_lq, w_lq), x.shape[0], x.device)
+            freqs = compute_mixed_rope(x, mixed_grid_sizes, dit.freqs, dit.num_heads, dit.dim)
+        else:
+            # Backward-compatible arg retention: sample-id stride is ignored in segment-id 4D mode.
+            mixed_grid_sizes_4d = build_mixed_grid_sizes_4d(
+                (f, h, w),
+                (f_lq, h_lq, w_lq),
+                x.shape[0],
+                x.device,
+                rope_segment_stride=rope_segment_stride,
+            )
+            max_segment_pos = rope_segment_stride
+            c = dit.dim // dit.num_heads // 2
+            freqs_4d = build_freqs_4d(dit.freqs, max_segment_pos=max_segment_pos, c=c, device=x.device)
+            freqs = compute_mixed_rope_4d(x, mixed_grid_sizes_4d, freqs_4d, dit.num_heads, dit.dim)
+    else:
+        freqs = torch.cat([
+            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # VAP 
     if vap is not None:
@@ -1423,11 +1627,15 @@ def model_fn_wan_video(
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
             x = x[:, :-pad_shape] if pad_shape > 0 else x
+    if use_lq_stream:
+        x = x[:, :seq_len_main]
+        print(f"[DBG]Main stream seq_len: {seq_len_main}, LQ stream seq_len: {x.shape[1] - seq_len_main}")
     # Remove reference latents
     if reference_latents is not None:
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
+    print(f"[DBG]Output shape after unpatchify: {x.shape}")
     return x
 
 

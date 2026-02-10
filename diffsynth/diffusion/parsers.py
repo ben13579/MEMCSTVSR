@@ -12,6 +12,8 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
 def add_stvsr_dataset_config(parser: argparse.ArgumentParser):
     parser.add_argument("--space_scale", type=int, default=4, help="Space scale for STVSR dataset, e.g., 4x. If provided, this will override the height and width config.")
     parser.add_argument("--time_scale", type=int, default=8, help="Time scale for STVSR dataset, e.g., 4x. If provided, this will override the num_frames config.")
+    parser.add_argument("--downsample_indexes", type=str, default="0,1,-2,-1", help="Indexes of frames to be downsampled in the STVSR dataset. Comma-separated. Supports negative indexing.")
+    parser.add_argument("--rope_mode", type=str, default="3d", choices=["3d", "4d"], help="ROPE mode for STVSR dataset. Supported options: '3d', '4d'.")
     return parser
 
 def add_image_size_config(parser: argparse.ArgumentParser):

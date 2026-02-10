@@ -303,6 +303,7 @@ class WanModel(torch.nn.Module):
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
+        self.num_heads = num_heads
 
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)

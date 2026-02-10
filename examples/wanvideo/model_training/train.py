@@ -23,6 +23,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        rope_mode="3d",
     ):
         super().__init__()
         # Warning
@@ -34,7 +35,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config, rope_mode=rope_mode)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
         # Training mode
@@ -85,6 +86,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "height": data["GT"][0].size[1],
             "width": data["GT"][0].size[0],
             "num_frames": len(data["GT"]),
+            "rope_mode": self.pipe.rope_mode if hasattr(self.pipe, "rope_mode") else "3d",
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -106,8 +108,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         # print(self.pipe.units)
         for unit in self.pipe.units:
             # print(unit)
-            if isinstance(unit, WanVideoUnit_ImageEmbedderFused):
-                print(unit.take_over)
+            # if isinstance(unit, WanVideoUnit_ImageEmbedderFused):
+            #     print(unit.take_over)
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         # print("[DBG] input keys after pipe:", inputs[0].keys())
         # print("[DBG] after forward inputs video shape:", inputs[0]["latents"].shape)
@@ -177,6 +179,7 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        rope_mode=args.rope_mode,
     )
     model_logger = ModelLogger(
         args.output_path,
