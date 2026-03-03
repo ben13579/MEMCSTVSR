@@ -32,6 +32,7 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     
     # loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
     loss = charbonnier_loss(noise_pred.float(), training_target.float())
+    # print(f"[DBG] train loss: {loss.item()}")
     loss = loss * pipe.scheduler.training_weight(timestep)
     return loss
 

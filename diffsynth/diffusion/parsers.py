@@ -67,6 +67,22 @@ def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     return parser
 
+def add_validation_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--val_dataset_base_path", type=str, default=None, help="Base path of the validation dataset.")
+    parser.add_argument("--val_dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the validation dataset.")
+    parser.add_argument("--val_data_file_keys", type=str, default="image,video,frames", help="Validation data file keys in metadata. Comma-separated.")
+    parser.add_argument("--validation_steps", type=int, default=500, help="Run validation every N training steps.")
+    parser.add_argument("--num_validation_samples", type=int, default=2, help="Max number of validation samples per validation run.")
+    parser.add_argument("--validation_num_inference_steps", type=int, default=50, help="Inference steps used during validation generation.")
+    parser.add_argument("--validation_seed", type=int, default=0, help="Random seed used during validation generation.")
+    parser.add_argument("--validation_fps", type=int, default=15, help="FPS for saved validation videos.")
+    parser.add_argument("--validation_quality", type=int, default=5, help="Quality for saved validation videos.")
+    parser.add_argument("--validation_output_subdir", type=str, default="validation", help="Validation output folder under output_path.")
+    parser.add_argument("--validation_cfg_scale", type=float, default=1.0, help="CFG scale used during validation generation.")
+    parser.add_argument("--validation_sigma_shift", type=float, default=5.0, help="Sigma shift used during validation generation.")
+    parser.add_argument("--validation_tiled", default=False, action="store_true", help="Whether to enable tiled VAE decode during validation.")
+    return parser
+
 def add_general_config(parser: argparse.ArgumentParser):
     parser = add_dataset_base_config(parser)
     parser = add_stvsr_dataset_config(parser)
@@ -75,4 +91,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
+    parser = add_validation_config(parser)
     return parser
