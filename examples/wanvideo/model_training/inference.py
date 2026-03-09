@@ -252,7 +252,8 @@ def run_inference_loop(args, dataset, pipe):
             record = {
                 "sample_id": idx,
                 "prompt": "",
-                "seed": args.seed + (idx - start_index) * args.seed_stride,
+                # "seed": args.seed + (idx - start_index) * args.seed_stride,
+                "seed": args.seed,
                 "pred_path": None,
                 "gt_path": None,
                 "lq_path": None,
@@ -337,6 +338,15 @@ def run_inference_loop(args, dataset, pipe):
         f"mean_psnr={summary['mean_psnr']},",
         f"mean_ssim={summary['mean_ssim']}",
     )
+    # os.makedirs(os.path.join(args.output_path, "summary"), exist_ok=True)
+    with open(os.path.join(args.output_path, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write(
+            f"num_samples={summary['num_samples']}\n"
+            f"num_successful={summary['num_successful']}\n"
+            f"num_failed={summary['num_failed']}\n"
+            f"mean_psnr={summary['mean_psnr']}\n"
+            f"mean_ssim={summary['mean_ssim']}\n"
+        )
     return summary
 
 

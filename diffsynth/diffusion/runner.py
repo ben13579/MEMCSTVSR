@@ -3,6 +3,8 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
+import numpy as np
+import random
 
 
 def launch_training_task(
@@ -24,9 +26,17 @@ def launch_training_task(
         save_steps = args.save_steps
         num_epochs = args.num_epochs
     
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    def seed_worker(worker_id):
+        worker_seed = (args.seed + worker_id) % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, worker_init_fn=seed_worker, generator=g)
     
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     

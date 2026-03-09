@@ -8,6 +8,8 @@ from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 from diffsynth.utils.data import save_video
 from accelerate import Accelerator
+import random
+from accelerate.utils import set_seed
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -253,7 +255,8 @@ def run_stvsr_validation(
                         negative_prompt="",
                         input_video=gt_video,
                         LQ_video=lq_video,
-                        seed=args.validation_seed + sample_id,
+                        # seed=args.validation_seed + sample_id,
+                        seed=args.validation_seed,
                         rand_device=pipe.device,
                         height=gt_video[0].size[1],
                         width=gt_video[0].size[0],
@@ -329,9 +332,17 @@ def launch_training_task_with_validation(
         save_steps = args.save_steps
         num_epochs = args.num_epochs
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    def seed_worker(worker_id):
+        worker_seed = (args.seed + worker_id) % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, worker_init_fn=seed_worker, generator=g)
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     global_step = 0
@@ -367,6 +378,15 @@ def launch_training_task_with_validation(
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    set_seed(args.seed)                 # 會處理 random / numpy / torch (含分散式)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    # 需要更強可重現（會變慢）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
