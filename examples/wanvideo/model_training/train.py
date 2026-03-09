@@ -325,9 +325,11 @@ def launch_training_task_with_validation(
     num_epochs: int = 1,
     args = None,
 ):
+    batch_size = 1
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
+        batch_size = args.batch_size
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
@@ -342,7 +344,15 @@ def launch_training_task_with_validation(
 
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, worker_init_fn=seed_worker, generator=g)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=lambda x: x,
+        num_workers=num_workers,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     global_step = 0
@@ -350,10 +360,13 @@ def launch_training_task_with_validation(
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
-                    loss = model({}, inputs=data)
-                else:
-                    loss = model(data)
+                losses = []
+                for sample in data:
+                    if dataset.load_from_cache:
+                        losses.append(model({}, inputs=sample))
+                    else:
+                        losses.append(model(sample))
+                loss = torch.stack(losses).mean()
                 if global_step % 100 == 0:
                     print(f"[Training] epoch={epoch_id}, step={global_step}, loss={loss.item()}")
                 accelerator.backward(loss)
