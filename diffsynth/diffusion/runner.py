@@ -29,12 +29,14 @@ def launch_training_task(
         num_epochs = args.num_epochs
     
     g = torch.Generator()
-    g.manual_seed(args.seed)
+    if args.seed is not None:
+        g.manual_seed(args.seed)
     def seed_worker(worker_id):
-        worker_seed = (args.seed + worker_id) % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+        if args.seed is not None:
+            worker_seed = (args.seed + worker_id) % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
 
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
