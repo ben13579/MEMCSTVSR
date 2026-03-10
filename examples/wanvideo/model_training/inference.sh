@@ -11,7 +11,7 @@ accelerate launch --num_processes 1 examples/wanvideo/model_training/inference.p
   --height 480 \
   --width 832 \
   --model_id_with_origin_paths "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth" \
-  --dit_checkpoint "./models/train/Wan2.1-T2V-1.3B_full/step-10000.safetensors" \
+  --dit_checkpoint "./models/train/Wan2.1-T2V-1.3B_full/step-6000.safetensors" \
   --output_path "./models/train/Wan2.1-T2V-1.3B_full/inference" \
   --num_inference_steps 50 \
   --cfg_scale 1.0 \

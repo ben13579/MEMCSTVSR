@@ -11,27 +11,31 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
     
     noise = torch.randn_like(inputs["input_latents"])
+    # print("noise_dtype:",noise.dtype)
+    # noise = inputs["noise"].to(dtype=pipe.torch_dtype, device=pipe.device)
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
-    print(f"[DBG] timestep_id: {timestep_id}, timestep: {timestep}, latents shape: {inputs['latents'].shape}, training_target shape: {training_target.shape}")
+    # print(f"[DBG] timestep_id: {timestep_id}, timestep: {timestep}, latents shape: {inputs['latents'].shape}, training_target shape: {training_target.shape}")
     
     if "HQ_latents" in inputs:
-        inputs["latents"] = torch.concat([inputs["HQ_latents"][:, :, 0:1], inputs["latents"]], dim=2)
+        cond0 = inputs["HQ_latents"][:, :, 0:1].detach()  # condition 通常 detach
+        inputs["latents"] = torch.concat([cond0, inputs["latents"]], dim=2)
 
     # if "first_frame_latents" in inputs:
     #     inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
     
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
-    
+    # print(f"[DBG] noise_pred shape: {noise_pred.shape}, training_target shape: {training_target.shape}")
     # if "first_frame_latents" in inputs:
     #     noise_pred = noise_pred[:, :, 1:]
     #     training_target = training_target[:, :, 1:]
     if "HQ_latents" in inputs:
         noise_pred = noise_pred[:, :, 1:]
     
-    # loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-    loss = charbonnier_loss(noise_pred.float(), training_target.float())
+    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    # loss = torch.nn.functional.l1_loss(noise_pred.float(), training_target.float())
+    # loss = charbonnier_loss(noise_pred.float(), training_target.float())
     # print(f"[DBG] train loss: {loss.item()}")
     loss = loss * pipe.scheduler.training_weight(timestep)
     return loss
@@ -146,3 +150,34 @@ def charbonnier_loss(pred, target, epsilon=1e-3, reduction='mean'):
         return loss
     else:
         raise ValueError(f"Unknown reduction: {reduction}")
+
+
+
+
+
+
+
+# def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
+#     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
+#     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+
+#     timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+#     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+    
+#     noise = torch.randn_like(inputs["input_latents"][:,:,1:])
+#     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"][:,:,1:], noise, timestep)
+#     training_target = pipe.scheduler.training_target(inputs["input_latents"][:,:,1:], noise, timestep)
+    
+#     if "HQ_latents" in inputs:
+#         cond0 = inputs["HQ_latents"][:, :, 0:1].detach()  # condition 通常 detach
+#         inputs["latents"] = torch.concat([cond0, inputs["latents"]], dim=2)
+    
+#     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+#     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
+
+#     if "HQ_latents" in inputs:
+#         noise_pred = noise_pred[:, :, 1:]
+
+#     loss = charbonnier_loss(noise_pred.float(), training_target.float())
+#     loss = loss * pipe.scheduler.training_weight(timestep)
+#     return loss

@@ -356,6 +356,7 @@ def launch_training_task_with_validation(
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     global_step = 0
+    best_loss = float("inf")
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
@@ -382,6 +383,11 @@ def launch_training_task_with_validation(
                     and global_step % args.validation_steps == 0
                 ):
                     run_stvsr_validation(accelerator, model, val_dataset, global_step, args)
+
+                # if loss.item() < best_loss:
+                #     best_loss = loss.item()
+                #     if accelerator.is_main_process:
+                #         model_logger.save_model(accelerator, model, "best_loss.safetensors")
 
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)

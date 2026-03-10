@@ -78,7 +78,7 @@ def add_validation_config(parser: argparse.ArgumentParser):
     parser.add_argument("--validation_num_inference_steps", type=int, default=50, help="Inference steps used during validation generation.")
     parser.add_argument("--validation_seed", type=int, default=0, help="Random seed used during validation generation.")
     parser.add_argument("--validation_fps", type=int, default=15, help="FPS for saved validation videos.")
-    parser.add_argument("--validation_quality", type=int, default=5, help="Quality for saved validation videos.")
+    parser.add_argument("--validation_quality", type=int, default=8, help="Quality for saved validation videos.")
     parser.add_argument("--validation_output_subdir", type=str, default="validation", help="Validation output folder under output_path.")
     parser.add_argument("--validation_cfg_scale", type=float, default=1.0, help="CFG scale used during validation generation.")
     parser.add_argument("--validation_sigma_shift", type=float, default=5.0, help="Sigma shift used during validation generation.")
