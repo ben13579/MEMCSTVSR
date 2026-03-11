@@ -1,4 +1,4 @@
-accelerate launch --num_processes 2 examples/wanvideo/model_training/train.py \
+accelerate launch --num_processes 1 examples/wanvideo/model_training/train.py \
   --dataset_base_path /project/bamboofan/Adobe240/frame/train \
   --dataset_metadata_path /project/bamboofan/Adobe240/frame/train/metadata_overfit.jsonl \
   --val_dataset_base_path /project/bamboofan/Adobe240/frame/train \
@@ -6,14 +6,14 @@ accelerate launch --num_processes 2 examples/wanvideo/model_training/train.py \
   --dataset_repeat 100 \
   --space_scale 4 \
   --time_scale 8 \
-  --rope_mode "4d" \
+  --rope_mode "3d" \
   --height 480 \
   --width 832 \
   --model_id_with_origin_paths "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth" \
   --learning_rate 1e-5 \
-  --num_epochs 300 \
+  --num_epochs 400 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/overfit" \
+  --output_path "./models/train/overfit_3d" \
   --trainable_models "dit" \
   --use_gradient_checkpointing \
   --save_steps 1000 \

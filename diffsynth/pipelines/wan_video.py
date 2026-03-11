@@ -1213,13 +1213,14 @@ class TemporalTiler_BCTHW:
 def build_mixed_grid_sizes(main_grid, lq_grid, batch_size, device):
     main_f, main_h, main_w = main_grid
     lq_f, lq_h, lq_w = lq_grid
-    main_start = torch.tensor([0, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-    main_end = torch.tensor([main_f, main_h, main_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_start = torch.tensor([1, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_end = torch.tensor([main_f + 1, main_h, main_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_size = torch.tensor([main_f, main_h, main_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     lq_start = torch.tensor([main_f, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     lq_end = torch.tensor([main_f + lq_f, lq_h, lq_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     lq_size = torch.tensor([lq_f, lq_h, lq_w], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     return [
-        [main_start, main_end, main_end],
+        [main_start, main_end, main_size],
         [lq_start, lq_end, lq_size],
     ]
 
@@ -1227,7 +1228,7 @@ def build_mixed_grid_sizes(main_grid, lq_grid, batch_size, device):
 def compute_mixed_rope(x_tokens, grid_sizes, freqs, num_heads, dim):
     if isinstance(freqs, (list, tuple)):
         freqs = torch.cat([f for f in freqs], dim=1)
-    rope = rope_precompute(
+    rope = rope_precompute_3d(
         x_tokens.detach().view(x_tokens.size(0), x_tokens.size(1), num_heads, dim // num_heads),
         grid_sizes,
         freqs,
@@ -1236,16 +1237,134 @@ def compute_mixed_rope(x_tokens, grid_sizes, freqs, num_heads, dim):
     return rope[0]
 
 
+def rope_precompute_3d(x, grid_sizes, freqs, start=None):
+    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+    if isinstance(freqs, (list, tuple)):
+        freqs = torch.cat([f for f in freqs], dim=1)
+    freqs = freqs.to(device=x.device)
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+    assert sum(split_sizes) == freqs.shape[1], (
+        f"3D RoPE split mismatch: split_sizes={split_sizes} sum={sum(split_sizes)} "
+        f"freq_dim={freqs.shape[1]} c={c}"
+    )
+    freqs = freqs.split(split_sizes, dim=1)
+
+    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    if start is not None:
+        raise ValueError("3D mixed RoPE only supports start=None in main+lq mode.")
+    if not isinstance(grid_sizes, list) or len(grid_sizes) != 2:
+        raise ValueError("3D mixed RoPE expects exactly two grid sizes: [main, lq].")
+    for idx, g in enumerate(grid_sizes):
+        if not isinstance(g, list) or len(g) != 3:
+            raise ValueError(f"Invalid grid format at index {idx}: expected [start, end, size].")
+        if g[0].shape != g[1].shape or g[0].shape != g[2].shape:
+            raise ValueError(f"Inconsistent tensor shapes in grid {idx}: {[u.shape for u in g]}.")
+
+    main_grid, lq_grid = grid_sizes
+    if main_grid[0].shape[0] != b or lq_grid[0].shape[0] != b:
+        raise ValueError(
+            f"Grid batch size mismatch with token batch size: x={b}, main={main_grid[0].shape[0]}, lq={lq_grid[0].shape[0]}"
+        )
+
+    main_delta = main_grid[1] - main_grid[0]
+    lq_delta = lq_grid[1] - lq_grid[0]
+    if torch.any(main_delta <= 0) or torch.any(lq_delta <= 0):
+        raise ValueError("Invalid 3D RoPE grid sizes with non-positive sequence axis.")
+    if not torch.equal(main_delta, main_delta[:1].expand_as(main_delta)):
+        raise ValueError("Mixed 3D RoPE expects identical main-grid extents across the batch.")
+    if not torch.equal(lq_delta, lq_delta[:1].expand_as(lq_delta)):
+        raise ValueError("Mixed 3D RoPE expects identical LQ-grid extents across the batch.")
+
+    seq_len_main = int((main_delta[0, 0] * main_delta[0, 1] * main_delta[0, 2]).item())
+    seq_len_lq = int((lq_delta[0, 0] * lq_delta[0, 1] * lq_delta[0, 2]).item())
+    if seq_len_main + seq_len_lq != s:
+        raise ValueError(
+            f"Mixed 3D RoPE seq_len mismatch: main({seq_len_main}) + lq({seq_len_lq}) != token_len({s})."
+        )
+
+    base_t_h = main_grid[2][:, 1].clone()
+    base_t_w = main_grid[2][:, 2].clone()
+
+    for j in range(b):
+        main_start = main_grid[0][j]
+        main_end = main_grid[1][j]
+        main_size = main_grid[2][j]
+        lq_start = lq_grid[0][j]
+        lq_end = lq_grid[1][j]
+        lq_size = lq_grid[2][j]
+
+        def build_segment_freqs(seg_start, seg_end, seg_size, use_lq_t_mapping=False):
+            f_o, h_o, w_o = seg_start
+            f, h, w = seg_end
+            t_f, t_h, t_w = seg_size
+            seq_f = int((f - f_o).item())
+            seq_h = int((h - h_o).item())
+            seq_w = int((w - w_o).item())
+            seq_len = seq_f * seq_h * seq_w
+            if min(seq_f, seq_h, seq_w) <= 0:
+                raise ValueError("Invalid 3D RoPE grid sizes with non-positive sequence axis.")
+
+            if use_lq_t_mapping:
+                main_end_t = float(main_end[0].item())
+                f_sam = build_lq_temporal_positions(seq_f, main_end_t, x.device)
+            elif f_o >= 0:
+                f_sam = torch.linspace(
+                    f_o.to(torch.float64), (t_f + f_o).to(torch.float64) - 1.0, steps=seq_f, device=x.device
+                )
+            else:
+                f_sam = torch.linspace(
+                    -f_o.to(torch.float64), (-t_f - f_o).to(torch.float64) + 1.0, steps=seq_f, device=x.device
+                )
+
+            base_h = base_t_h[j].to(torch.float64)
+            base_w = base_t_w[j].to(torch.float64)
+            cur_h = t_h.to(torch.float64)
+            cur_w = t_w.to(torch.float64)
+            scale_h = (base_h / cur_h) if base_h > 0 else torch.tensor(1.0, dtype=torch.float64, device=x.device)
+            scale_w = (base_w / cur_w) if base_w > 0 else torch.tensor(1.0, dtype=torch.float64, device=x.device)
+            offset_h = (scale_h - 1.0) * 0.5
+            offset_w = (scale_w - 1.0) * 0.5
+            h_start = h_o.to(torch.float64) + offset_h
+            h_end = (h_o.to(torch.float64) + base_h - 1.0) - offset_h
+            w_start = w_o.to(torch.float64) + offset_w
+            w_end = (w_o.to(torch.float64) + base_w - 1.0) - offset_w
+            h_sam = torch.linspace(h_start, h_end, steps=seq_h, device=x.device, dtype=torch.float64)
+            w_sam = torch.linspace(w_start, w_end, steps=seq_w, device=x.device, dtype=torch.float64)
+
+            if float(f_sam.max().item()) >= freqs[0].shape[0] or float(f_sam.min().item()) < 0:
+                raise ValueError(f"F-axis RoPE index out of range: {f_sam.tolist()}.")
+            if float(h_sam.max().item()) >= freqs[1].shape[0] or float(h_sam.min().item()) < 0:
+                raise ValueError(f"H-axis RoPE index out of range: {h_sam.tolist()}.")
+            if float(w_sam.max().item()) >= freqs[2].shape[0] or float(w_sam.min().item()) < 0:
+                raise ValueError(f"W-axis RoPE index out of range: {w_sam.tolist()}.")
+
+            freqs_f = lerp_1d_table(freqs[0], f_sam).view(seq_f, 1, 1, -1)
+            freqs_h = lerp_1d_table(freqs[1], h_sam).view(1, seq_h, 1, -1)
+            freqs_w = lerp_1d_table(freqs[2], w_sam).view(1, 1, seq_w, -1)
+            freqs_i = torch.cat([
+                freqs_f.expand(seq_f, seq_h, seq_w, -1),
+                freqs_h.expand(seq_f, seq_h, seq_w, -1),
+                freqs_w.expand(seq_f, seq_h, seq_w, -1),
+            ], dim=-1).reshape(seq_len, 1, -1)
+            return freqs_i
+
+        main_freqs = build_segment_freqs(main_start, main_end, main_size, use_lq_t_mapping=False)
+        lq_freqs = build_segment_freqs(lq_start, lq_end, lq_size, use_lq_t_mapping=True)
+        output[j, :seq_len_main] = main_freqs
+        output[j, seq_len_main:seq_len_main + seq_len_lq] = lq_freqs
+    return output
+
+
 def build_mixed_grid_sizes_4d(main_grid, lq_grid, batch_size, device):
     # 4th axis encodes segment id (g index), not sample id.
     main_f, main_h, main_w = main_grid
     lq_f, lq_h, lq_w = lq_grid
-    main_start = torch.tensor([1, 0, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-    main_end = torch.tensor([main_f + 1, main_h, main_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_start = torch.tensor([0, 0, 0, 0], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    main_end = torch.tensor([main_f, main_h, main_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     main_size = torch.tensor([main_f, main_h, main_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
 
-    lq_start = torch.tensor([main_f, 0, 0, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-    lq_end = torch.tensor([main_f + lq_f, lq_h, lq_w, 2], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    lq_start = torch.tensor([0, 0, 0, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+    lq_end = torch.tensor([lq_f, lq_h, lq_w, 2], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     lq_size = torch.tensor([lq_f, lq_h, lq_w, 1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     return [
         [main_start, main_end, main_size],
@@ -1279,6 +1398,8 @@ def lerp_1d_table(table_1d: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     pos: (N,) float, in [0, L-1]
     return: (N, D)
     """
+    if table_1d.device != pos.device:
+        table_1d = table_1d.to(pos.device)
     L = table_1d.shape[0]
     pos = pos.clamp(0, L - 1)
 
@@ -1291,58 +1412,59 @@ def lerp_1d_table(table_1d: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return v0 + (v1 - v0) * w
 
 
-def build_lq_temporal_positions(
-    lq_f: int,
-    main_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if lq_f <= 0:
-        raise ValueError(f"Invalid lq temporal size: {lq_f}.")
-    if main_len <= 0:
-        raise ValueError(f"Invalid main temporal size: {main_len}.")
 
-    main_last = float(main_len - 1)
+# def build_lq_temporal_positions(
+#     lq_f: int,
+#     main_len: int,
+#     device: torch.device,
+# ) -> torch.Tensor:
+#     if lq_f <= 0:
+#         raise ValueError(f"Invalid lq temporal size: {lq_f}.")
+#     if main_len <= 0:
+#         raise ValueError(f"Invalid main temporal size: {main_len}.")
 
-    if lq_f == 1:
-        return torch.tensor([0.0], dtype=torch.float64, device=device)
-    if lq_f == 2:
-        # [main first, extra]
-        return torch.tensor([0.0, float(main_len)], dtype=torch.float64, device=device)
-    if lq_f == 3:
-        # [main first, main last, extra]
-        return torch.tensor([0.0, main_last, float(main_len)], dtype=torch.float64, device=device)
+#     main_last = float(main_len - 1)
 
-    f_sam = torch.empty((lq_f,), dtype=torch.float64, device=device)
-    f_sam[0] = 0.0
-    f_sam[1] = 1.0
+#     if lq_f == 1:
+#         return torch.tensor([0.0], dtype=torch.float64, device=device)
+#     if lq_f == 2:
+#         # [main first, extra]
+#         return torch.tensor([0.0, float(main_len)], dtype=torch.float64, device=device)
+#     if lq_f == 3:
+#         # [main first, main last, extra]
+#         return torch.tensor([0.0, main_last, float(main_len)], dtype=torch.float64, device=device)
 
-    # indices 2 ... lq_f-2 should span from 1 ... main_len-1
-    mid_idx = torch.arange(2, lq_f - 1, dtype=torch.float64, device=device)
-    mid_t = (mid_idx - 1.0) / float(lq_f - 3)
-    f_sam[2:lq_f - 1] = 1.0 + (main_last - 1.0) * mid_t
+#     f_sam = torch.empty((lq_f,), dtype=torch.float64, device=device)
+#     f_sam[0] = 0.0
+#     f_sam[1] = 1.0
 
-    # last one is extra frame
-    f_sam[lq_f - 1] = float(main_len)
-    return f_sam
+#     # indices 2 ... lq_f-2 should span from 1 ... main_len-1
+#     mid_idx = torch.arange(2, lq_f - 1, dtype=torch.float64, device=device)
+#     mid_t = (mid_idx - 1.0) / float(lq_f - 3)
+#     f_sam[2:lq_f - 1] = 1.0 + (main_last - 1.0) * mid_t
 
-
-# def build_lq_temporal_positions(lq_f: int, main_end: float, device: torch.device) -> torch.Tensor: 
-#     if lq_f <= 0: 
-#         raise ValueError(f"Invalid lq temporal size: {lq_f}.") 
-#     if lq_f == 1: 
-#         return torch.tensor([0.0], dtype=torch.float64, device=device) 
-#     if lq_f == 2: 
-#         return torch.tensor([0.0, 1.0], dtype=torch.float64, device=device) 
-#     if lq_f == 3: 
-#         return torch.tensor([0.0, 1.0, main_end], dtype=torch.float64, device=device) 
-#     f_sam = torch.empty((lq_f,), dtype=torch.float64, device=device) 
-#     f_sam[0] = 0.0 
-#     f_sam[1] = 1.0 
-#     mid_idx = torch.arange(2, lq_f - 1, dtype=torch.float64, device=device) 
-#     mid_t = (mid_idx - 1.0) / float(lq_f - 3) 
-#     f_sam[2:lq_f - 1] = 1.0 + (main_end - 1.0) * mid_t 
-#     f_sam[lq_f - 1] = main_end + 1.0 
+#     # last one is extra frame
+#     f_sam[lq_f - 1] = float(main_len)
 #     return f_sam
+
+
+def build_lq_temporal_positions(lq_f: int, main_end: float, device: torch.device) -> torch.Tensor: 
+    if lq_f <= 0: 
+        raise ValueError(f"Invalid lq temporal size: {lq_f}.") 
+    if lq_f == 1: 
+        return torch.tensor([0.0], dtype=torch.float64, device=device) 
+    if lq_f == 2: 
+        return torch.tensor([0.0, 1.0], dtype=torch.float64, device=device) 
+    if lq_f == 3: 
+        return torch.tensor([0.0, 1.0, main_end], dtype=torch.float64, device=device) 
+    f_sam = torch.empty((lq_f,), dtype=torch.float64, device=device) 
+    f_sam[0] = 0.0 
+    f_sam[1] = 1.0 
+    mid_idx = torch.arange(2, lq_f - 1, dtype=torch.float64, device=device) 
+    mid_t = (mid_idx - 1.0) / float(lq_f - 3) 
+    f_sam[2:lq_f - 1] = 1.0 + (main_end - 1.0) * mid_t 
+    f_sam[lq_f - 1] = main_end + 1.0 
+    return f_sam
 
 def rope_precompute_4d(x, grid_sizes, freqs, start=None):
     b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
@@ -1436,9 +1558,9 @@ def rope_precompute_4d(x, grid_sizes, freqs, start=None):
             offset_h = (scale_h - 1.0) * 0.5
             offset_w = (scale_w - 1.0) * 0.5
             h_start = h_o.to(torch.float64) + offset_h
-            h_end = (h_o.to(torch.float64) + base_h - 1.0) + offset_h
+            h_end = (h_o.to(torch.float64) + base_h - 1.0) - offset_h
             w_start = w_o.to(torch.float64) + offset_w
-            w_end = (w_o.to(torch.float64) + base_w - 1.0) + offset_w
+            w_end = (w_o.to(torch.float64) + base_w - 1.0) - offset_w
             h_sam = torch.linspace(h_start, h_end, steps=seq_h, device=x.device, dtype=torch.float64)
             w_sam = torch.linspace(w_start, w_end, steps=seq_w, device=x.device, dtype=torch.float64)
 
@@ -1464,7 +1586,8 @@ def rope_precompute_4d(x, grid_sizes, freqs, start=None):
             return freqs_i
 
         main_freqs = build_segment_freqs(main_start, main_end, main_size, use_lq_t_mapping=False)
-        lq_freqs = build_segment_freqs(lq_start, lq_end, lq_size, use_lq_t_mapping=True)
+        # lq_freqs = build_segment_freqs(lq_start, lq_end, lq_size, use_lq_t_mapping=True)
+        lq_freqs = build_segment_freqs(lq_start, lq_end, lq_size, use_lq_t_mapping=False)
         output[j, :seq_len_main] = main_freqs
         output[j, seq_len_main:seq_len_main + seq_len_lq] = lq_freqs
     return output
