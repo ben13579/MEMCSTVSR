@@ -1,4 +1,4 @@
-import torch, torchvision, imageio, os
+import torch, torchvision, imageio, os, math
 import imageio.v3 as iio
 from PIL import Image
 
@@ -347,3 +347,42 @@ class DownsampleVideo(DataProcessingOperator):
                 frame.resize((new_w, new_h), resample=Image.BICUBIC)
             )
         return downsampled_frames
+
+
+class DownsampleVideoforIND(DataProcessingOperator):
+    def __init__(self, space_scale=2.5):
+        self.space_scale = float(space_scale)
+
+    @staticmethod
+    def ceil_to_multiple(x, base):
+        return int(math.ceil(x / base) * base)
+
+    def __call__(self, frames):
+        # frames: list[PIL.Image]
+        n = len(frames)
+        if n == 0:
+            return []
+
+        # diffusion handles integer part
+        k_space = max(1, int(math.floor(self.space_scale)))
+
+        # decoder handles only fractional part
+        frac_space = self.space_scale / k_space
+
+        w, h = frames[0].size
+
+        # resize to GT / frac_space
+        raw_new_w = w / frac_space
+        raw_new_h = h / frac_space
+
+        # make sure divisible by 8 using ceiling
+        new_w = max(8, self.ceil_to_multiple(raw_new_w, 8))
+        new_h = max(8, self.ceil_to_multiple(raw_new_h, 8))
+
+        resized_frames = [
+            f.resize((new_w, new_h), resample=Image.BICUBIC)
+            for f in frames
+        ]
+
+        # temporal: keep unchanged
+        return resized_frames
