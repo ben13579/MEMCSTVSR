@@ -1,2 +1,2 @@
 from .unified_dataset import UnifiedDataset
-from .stvsr_dataset import STVSRDataset
+from .stvsr_dataset import INDDataset, STVSRDataset

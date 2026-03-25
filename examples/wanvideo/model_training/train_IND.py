@@ -529,7 +529,10 @@ def run_ind_validation(accelerator, model, val_dataset, global_step, args):
                         fps=args.validation_fps,
                         quality=args.validation_quality,
                     )
-                    psnr = 10 * torch.log10(1 / outputs["loss_mse"]).item() if outputs["loss_mse"].item() > 0 else float("inf")
+                    pred = (outputs["pred_video"].float() * 0.5 + 0.5).clamp(0, 1)
+                    gt = (outputs["gt_video"].float() * 0.5 + 0.5).clamp(0, 1)
+                    mse = F.mse_loss(pred, gt)
+                    psnr = (-10 * torch.log10(mse)).item() if mse.item() > 0 else float("inf")
                     local_psnr_sum += psnr
                     local_loss_sum += outputs["loss"].item()
                     local_mse_sum += outputs["loss_mse"].item()
@@ -627,11 +630,16 @@ def launch_ind_training(
         worker_init_fn=seed_worker,
         generator=g,
     )
-    total_training_steps = max(1, args.num_epochs * len(dataloader)*2)
+    total_training_steps = max(1, args.num_epochs * len(dataloader)*4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=total_training_steps,
     )
+    # scheduler = torch.optim.lr_scheduler.ConstantLR(
+    #     optimizer,
+    #     factor=0.1,
+    #     total_iters=total_training_steps // 10,
+    # )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.runtime_device = accelerator.device
