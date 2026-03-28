@@ -166,12 +166,14 @@ class LIIF3D(nn.Module):
         local_ensemble=True,
         coord_embed_mode="raw",
         coord_embed_dim=16,
+        neighbor_fusion_mode="weighted",
     ):
         super().__init__()
         self.cell_decode = cell_decode
         self.local_ensemble = local_ensemble
         self.coord_embed_mode = coord_embed_mode
         self.coord_embed_dim = coord_embed_dim
+        self.neighbor_fusion_mode = neighbor_fusion_mode
 
         if coord_embed_mode == "raw":
             coord_in_dim = 3
@@ -179,10 +181,20 @@ class LIIF3D(nn.Module):
             coord_in_dim = 3 * coord_embed_dim
         else:
             raise ValueError(f"Unsupported coord_embed_mode: {coord_embed_mode}")
+        self.coord_in_dim = coord_in_dim
 
-        imnet_in_dim = in_dim + coord_in_dim
-        if cell_decode:
-            imnet_in_dim += 3
+        self.num_neighbors = 8 if local_ensemble else 1
+
+        if neighbor_fusion_mode == "weighted":
+            imnet_in_dim = in_dim + coord_in_dim
+            if cell_decode:
+                imnet_in_dim += 3
+        elif neighbor_fusion_mode == "concat_once":
+            imnet_in_dim = self.num_neighbors * (in_dim + coord_in_dim)
+            if cell_decode:
+                imnet_in_dim += 3
+        else:
+            raise ValueError(f"Unsupported neighbor_fusion_mode: {neighbor_fusion_mode}")
         self.imnet = MLP(imnet_in_dim, out_dim, hidden_list)
 
     def _get_feat_coord(self, feat):
@@ -191,7 +203,19 @@ class LIIF3D(nn.Module):
         feat_coord = feat_coord.permute(3, 0, 1, 2).unsqueeze(0).expand(b, -1, -1, -1, -1)
         return feat_coord
 
-    def query_rgb(self, feat, coord, cell):
+    def _encode_coord(self, rel_coord):
+        if self.coord_embed_mode == "sinusoidal":
+            return sinusoidal_embed_coord(rel_coord, self.coord_embed_dim)
+        return rel_coord
+
+    def _build_rel_cell(self, cell, feat):
+        rel_cell = cell.clone()
+        rel_cell[:, :, 0] *= feat.shape[-3]
+        rel_cell[:, :, 1] *= feat.shape[-2]
+        rel_cell[:, :, 2] *= feat.shape[-1]
+        return rel_cell
+
+    def _neighbor_offsets(self):
         if self.local_ensemble:
             vt_lst = (-1, 1)
             vy_lst = (-1, 1)
@@ -201,80 +225,105 @@ class LIIF3D(nn.Module):
             vt_lst = vy_lst = vx_lst = (0,)
             eps_shift = 0.0
 
+        offsets = []
+        for vt in vt_lst:
+            for vy in vy_lst:
+                for vx in vx_lst:
+                    offsets.append((vt, vy, vx))
+        return offsets, eps_shift
+
+    def _sample_neighbors(self, feat, coord):
+        offsets, eps_shift = self._neighbor_offsets()
+
         rt = 1.0 / feat.shape[-3]
         ry = 1.0 / feat.shape[-2]
         rx = 1.0 / feat.shape[-1]
         feat_coord = self._get_feat_coord(feat)
 
+        sampled_feats = []
+        coord_inputs = []
+        rel_coords = []
+        for vt, vy, vx in offsets:
+            coord_ = coord.clone()
+            coord_[:, :, 0] += vt * rt + eps_shift
+            coord_[:, :, 1] += vy * ry + eps_shift
+            coord_[:, :, 2] += vx * rx + eps_shift
+            coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+
+            grid = coord_.reshape(coord_.shape[0], 1, 1, coord_.shape[1], 3)
+            grid = grid[..., [2, 1, 0]]
+
+            q_feat = F.grid_sample(
+                feat,
+                grid,
+                mode="nearest",
+                align_corners=False,
+            )[:, :, 0, 0, :].permute(0, 2, 1)
+            q_coord = F.grid_sample(
+                feat_coord,
+                grid,
+                mode="nearest",
+                align_corners=False,
+            )[:, :, 0, 0, :].permute(0, 2, 1)
+
+            rel_coord = coord - q_coord
+            rel_coord[:, :, 0] *= feat.shape[-3]
+            rel_coord[:, :, 1] *= feat.shape[-2]
+            rel_coord[:, :, 2] *= feat.shape[-1]
+
+            sampled_feats.append(q_feat)
+            coord_inputs.append(self._encode_coord(rel_coord))
+            rel_coords.append(rel_coord)
+
+        sampled_feats = torch.stack(sampled_feats, dim=2)
+        coord_inputs = torch.stack(coord_inputs, dim=2)
+        rel_coords = torch.stack(rel_coords, dim=2)
+        return sampled_feats, coord_inputs, rel_coords, offsets
+
+    def _query_rgb_weighted(self, feat, coord, cell):
+        sampled_feats, coord_inputs, rel_coords, offsets = self._sample_neighbors(feat, coord)
+        bs, q = coord.shape[:2]
+        rel_cell = self._build_rel_cell(cell, feat) if self.cell_decode else None
+
         preds = []
-        areas = []
-        corner_indices = []
-        for vt in vt_lst:
-            for vy in vy_lst:
-                for vx in vx_lst:
-                    corner_indices.append((vt, vy, vx))
-                    coord_ = coord.clone()
-                    coord_[:, :, 0] += vt * rt + eps_shift
-                    coord_[:, :, 1] += vy * ry + eps_shift
-                    coord_[:, :, 2] += vx * rx + eps_shift
-                    coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+        for neighbor_id in range(sampled_feats.shape[2]):
+            inp = torch.cat([sampled_feats[:, :, neighbor_id, :], coord_inputs[:, :, neighbor_id, :]], dim=-1)
+            if self.cell_decode:
+                inp = torch.cat([inp, rel_cell], dim=-1)
+            pred = self.imnet(inp.reshape(bs * q, -1)).view(bs, q, -1)
+            preds.append(pred)
 
-                    grid = coord_.view(coord_.shape[0], 1, 1, coord_.shape[1], 3) # 把 query 座標 reshape 成 grid_sample 可用的 5D grid
-                    grid = grid[..., [2, 1, 0]] # 把座標順序從 (t, y, x) 改成 grid_sample 需要的 (x, y, t)
-
-                    q_feat = F.grid_sample(
-                        feat,
-                        grid,
-                        mode="nearest",
-                        align_corners=False,
-                    )[:, :, 0, 0, :].permute(0, 2, 1)
-                    q_coord = F.grid_sample(
-                        feat_coord,
-                        grid,
-                        mode="nearest",
-                        align_corners=False,
-                    )[:, :, 0, 0, :].permute(0, 2, 1)
-
-                    rel_coord = coord - q_coord
-                    rel_coord[:, :, 0] *= feat.shape[-3]
-                    rel_coord[:, :, 1] *= feat.shape[-2]
-                    rel_coord[:, :, 2] *= feat.shape[-1]
-
-                    if self.coord_embed_mode == "sinusoidal":
-                        coord_input = sinusoidal_embed_coord(rel_coord, self.coord_embed_dim)
-                    else:
-                        coord_input = rel_coord
-
-                    inp = torch.cat([q_feat, coord_input], dim=-1)
-                    if self.cell_decode:
-                        rel_cell = cell.clone()
-                        rel_cell[:, :, 0] *= feat.shape[-3]
-                        rel_cell[:, :, 1] *= feat.shape[-2]
-                        rel_cell[:, :, 2] *= feat.shape[-1]
-                        inp = torch.cat([inp, rel_cell], dim=-1)
-
-                    bs, q = coord.shape[:2]
-                    pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
-                    preds.append(pred)
-
-                    area = torch.abs(
-                        rel_coord[:, :, 0] * rel_coord[:, :, 1] * rel_coord[:, :, 2]
-                    )
-                    areas.append(area + 1e-9)
+        areas = torch.abs(rel_coords[:, :, :, 0] * rel_coords[:, :, :, 1] * rel_coords[:, :, :, 2]) + 1e-9
 
         if self.local_ensemble:
-            corner_to_index = {corner: index for index, corner in enumerate(corner_indices)}
-            reordered_areas = [None] * len(areas)
-            for index, corner in enumerate(corner_indices):
+            corner_to_index = {corner: index for index, corner in enumerate(offsets)}
+            reordered_areas = [None] * len(offsets)
+            for index, corner in enumerate(offsets):
                 opposite_corner = (-corner[0], -corner[1], -corner[2])
-                reordered_areas[index] = areas[corner_to_index[opposite_corner]]
-            areas = reordered_areas
+                reordered_areas[index] = areas[:, :, corner_to_index[opposite_corner]]
+            areas = torch.stack(reordered_areas, dim=2)
 
-        tot_area = torch.stack(areas, dim=0).sum(dim=0)
+        tot_area = areas.sum(dim=2)
         ret = 0
-        for pred, area in zip(preds, areas):
+        for neighbor_id, pred in enumerate(preds):
+            area = areas[:, :, neighbor_id]
             ret = ret + pred * (area / tot_area).unsqueeze(-1)
         return ret
+
+    def _query_rgb_concat_once(self, feat, coord, cell):
+        sampled_feats, coord_inputs, _, _ = self._sample_neighbors(feat, coord)
+        bs, q = coord.shape[:2]
+
+        inp = torch.cat([sampled_feats, coord_inputs], dim=-1).reshape(bs, q, -1)
+        if self.cell_decode:
+            rel_cell = self._build_rel_cell(cell, feat)
+            inp = torch.cat([inp, rel_cell], dim=-1)
+        return self.imnet(inp.reshape(bs * q, -1)).view(bs, q, -1)
+
+    def query_rgb(self, feat, coord, cell):
+        if self.neighbor_fusion_mode == "weighted":
+            return self._query_rgb_weighted(feat, coord, cell)
+        return self._query_rgb_concat_once(feat, coord, cell)
 
     def batched_predict(
         self,
@@ -373,12 +422,14 @@ class LIIF2D(nn.Module):
         local_ensemble=True,
         coord_embed_mode="raw",
         coord_embed_dim=16,
+        neighbor_fusion_mode="weighted",
     ):
         super().__init__()
         self.cell_decode = cell_decode
         self.local_ensemble = local_ensemble
         self.coord_embed_mode = coord_embed_mode
         self.coord_embed_dim = coord_embed_dim
+        self.neighbor_fusion_mode = neighbor_fusion_mode
 
         if coord_embed_mode == "raw":
             coord_in_dim = 2
@@ -386,10 +437,20 @@ class LIIF2D(nn.Module):
             coord_in_dim = 2 * coord_embed_dim
         else:
             raise ValueError(f"Unsupported coord_embed_mode: {coord_embed_mode}")
+        self.coord_in_dim = coord_in_dim
 
-        imnet_in_dim = in_dim + coord_in_dim
-        if cell_decode:
-            imnet_in_dim += 2
+        self.num_neighbors = 4 if local_ensemble else 1
+
+        if neighbor_fusion_mode == "weighted":
+            imnet_in_dim = in_dim + coord_in_dim
+            if cell_decode:
+                imnet_in_dim += 2
+        elif neighbor_fusion_mode == "concat_once":
+            imnet_in_dim = self.num_neighbors * (in_dim + coord_in_dim)
+            if cell_decode:
+                imnet_in_dim += 2
+        else:
+            raise ValueError(f"Unsupported neighbor_fusion_mode: {neighbor_fusion_mode}")
         self.imnet = MLP(imnet_in_dim, out_dim, hidden_list)
 
     def _get_feat_2d(self, feat):
@@ -425,10 +486,18 @@ class LIIF2D(nn.Module):
         feat_coord = feat_coord.permute(2, 0, 1).unsqueeze(0).expand(b, -1, -1, -1)
         return feat_coord
 
-    def query_rgb(self, feat, coord, cell):
-        feat_2d = self._get_feat_2d(feat)
-        coord, cell = self._normalize_coord_and_cell(coord, cell)
+    def _encode_coord(self, rel_coord):
+        if self.coord_embed_mode == "sinusoidal":
+            return sinusoidal_embed_coord(rel_coord, self.coord_embed_dim)
+        return rel_coord
 
+    def _build_rel_cell(self, cell, feat_2d):
+        rel_cell = cell.clone()
+        rel_cell[:, :, 0] *= feat_2d.shape[-2]
+        rel_cell[:, :, 1] *= feat_2d.shape[-1]
+        return rel_cell
+
+    def _neighbor_offsets(self):
         if self.local_ensemble:
             vy_lst = (-1, 1)
             vx_lst = (-1, 1)
@@ -437,72 +506,102 @@ class LIIF2D(nn.Module):
             vy_lst = vx_lst = (0,)
             eps_shift = 0.0
 
+        offsets = []
+        for vy in vy_lst:
+            for vx in vx_lst:
+                offsets.append((vy, vx))
+        return offsets, eps_shift
+
+    def _sample_neighbors(self, feat, coord, cell):
+        feat_2d = self._get_feat_2d(feat)
+        coord, cell = self._normalize_coord_and_cell(coord, cell)
+        offsets, eps_shift = self._neighbor_offsets()
+
         ry = 1.0 / feat_2d.shape[-2]
         rx = 1.0 / feat_2d.shape[-1]
         feat_coord = self._get_feat_coord(feat_2d)
 
+        sampled_feats = []
+        coord_inputs = []
+        rel_coords = []
+        for vy, vx in offsets:
+            coord_ = coord.clone()
+            coord_[:, :, 0] += vy * ry + eps_shift
+            coord_[:, :, 1] += vx * rx + eps_shift
+            coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+
+            grid = coord_.flip(-1).unsqueeze(1)
+
+            q_feat = F.grid_sample(
+                feat_2d,
+                grid,
+                mode="nearest",
+                align_corners=False,
+            )[:, :, 0, :].permute(0, 2, 1)
+            q_coord = F.grid_sample(
+                feat_coord,
+                grid,
+                mode="nearest",
+                align_corners=False,
+            )[:, :, 0, :].permute(0, 2, 1)
+
+            rel_coord = coord - q_coord
+            rel_coord[:, :, 0] *= feat_2d.shape[-2]
+            rel_coord[:, :, 1] *= feat_2d.shape[-1]
+
+            sampled_feats.append(q_feat)
+            coord_inputs.append(self._encode_coord(rel_coord))
+            rel_coords.append(rel_coord)
+
+        sampled_feats = torch.stack(sampled_feats, dim=2)
+        coord_inputs = torch.stack(coord_inputs, dim=2)
+        rel_coords = torch.stack(rel_coords, dim=2)
+        return feat_2d, coord, cell, sampled_feats, coord_inputs, rel_coords, offsets
+
+    def _query_rgb_weighted(self, feat, coord, cell):
+        feat_2d, coord, cell, sampled_feats, coord_inputs, rel_coords, offsets = self._sample_neighbors(feat, coord, cell)
+        bs, q = coord.shape[:2]
+        rel_cell = self._build_rel_cell(cell, feat_2d) if self.cell_decode else None
+
         preds = []
-        areas = []
-        corner_indices = []
-        for vy in vy_lst:
-            for vx in vx_lst:
-                corner_indices.append((vy, vx))
-                coord_ = coord.clone()
-                coord_[:, :, 0] += vy * ry + eps_shift
-                coord_[:, :, 1] += vx * rx + eps_shift
-                coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+        for neighbor_id in range(sampled_feats.shape[2]):
+            inp = torch.cat([sampled_feats[:, :, neighbor_id, :], coord_inputs[:, :, neighbor_id, :]], dim=-1)
+            if self.cell_decode:
+                inp = torch.cat([inp, rel_cell], dim=-1)
+            pred = self.imnet(inp.reshape(bs * q, -1)).view(bs, q, -1)
+            preds.append(pred)
 
-                grid = coord_.flip(-1).unsqueeze(1)
-
-                q_feat = F.grid_sample(
-                    feat_2d,
-                    grid,
-                    mode="nearest",
-                    align_corners=False,
-                )[:, :, 0, :].permute(0, 2, 1)
-                q_coord = F.grid_sample(
-                    feat_coord,
-                    grid,
-                    mode="nearest",
-                    align_corners=False,
-                )[:, :, 0, :].permute(0, 2, 1)
-
-                rel_coord = coord - q_coord
-                rel_coord[:, :, 0] *= feat_2d.shape[-2]
-                rel_coord[:, :, 1] *= feat_2d.shape[-1]
-
-                if self.coord_embed_mode == "sinusoidal":
-                    coord_input = sinusoidal_embed_coord(rel_coord, self.coord_embed_dim)
-                else:
-                    coord_input = rel_coord
-
-                inp = torch.cat([q_feat, coord_input], dim=-1)
-                if self.cell_decode:
-                    rel_cell = cell.clone()
-                    rel_cell[:, :, 0] *= feat_2d.shape[-2]
-                    rel_cell[:, :, 1] *= feat_2d.shape[-1]
-                    inp = torch.cat([inp, rel_cell], dim=-1)
-
-                bs, q = coord.shape[:2]
-                pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
-                preds.append(pred)
-
-                area = torch.abs(rel_coord[:, :, 0] * rel_coord[:, :, 1])
-                areas.append(area + 1e-9)
+        areas = torch.abs(rel_coords[:, :, :, 0] * rel_coords[:, :, :, 1]) + 1e-9
 
         if self.local_ensemble:
-            corner_to_index = {corner: index for index, corner in enumerate(corner_indices)}
-            reordered_areas = [None] * len(areas)
-            for index, corner in enumerate(corner_indices):
+            corner_to_index = {corner: index for index, corner in enumerate(offsets)}
+            reordered_areas = [None] * len(offsets)
+            for index, corner in enumerate(offsets):
                 opposite_corner = (-corner[0], -corner[1])
-                reordered_areas[index] = areas[corner_to_index[opposite_corner]]
-            areas = reordered_areas
+                reordered_areas[index] = areas[:, :, corner_to_index[opposite_corner]]
+            areas = torch.stack(reordered_areas, dim=2)
 
-        tot_area = torch.stack(areas, dim=0).sum(dim=0)
+        tot_area = areas.sum(dim=2)
         ret = 0
-        for pred, area in zip(preds, areas):
+        for neighbor_id, pred in enumerate(preds):
+            area = areas[:, :, neighbor_id]
             ret = ret + pred * (area / tot_area).unsqueeze(-1)
         return ret
+
+    def _query_rgb_concat_once(self, feat, coord, cell):
+        feat_2d, coord, cell, sampled_feats, coord_inputs, _, _ = self._sample_neighbors(feat, coord, cell)
+        bs, q = coord.shape[:2]
+
+        inp = torch.cat([sampled_feats, coord_inputs], dim=-1).reshape(bs, q, -1)
+        if self.cell_decode:
+            rel_cell = self._build_rel_cell(cell, feat_2d)
+            inp = torch.cat([inp, rel_cell], dim=-1)
+        return self.imnet(inp.reshape(bs * q, -1)).view(bs, q, -1)
+
+    def query_rgb(self, feat, coord, cell):
+        if self.neighbor_fusion_mode == "weighted":
+            return self._query_rgb_weighted(feat, coord, cell)
+        return self._query_rgb_concat_once(feat, coord, cell)
 
     def batched_predict(
         self,
@@ -603,6 +702,15 @@ class WanVideoIND(nn.Module):
         liif_config=None,
     ):
         super().__init__()
+        # decoder_defaults = {
+        #     "dim": 96,
+        #     "z_dim": 16,
+        #     "dim_mult": [1, 2, 4, 4],
+        #     "num_res_blocks": 2,
+        #     "attn_scales": [],
+        #     "temperal_upsample": [True, True, False],
+        #     "dropout": 0.0,
+        # }
         decoder_defaults = {
             "dim": 96,
             "z_dim": 16,
@@ -616,9 +724,10 @@ class WanVideoIND(nn.Module):
             "hidden_list": [256, 256, 256, 256],
             "cell_decode": True,
             "local_ensemble": True,
+            "neighbor_fusion_mode": "concat_once",
             "coord_embed_mode": "raw",
             "coord_embed_dim": 16,
-            "mode": "2d",
+            "mode": "3d",
         }
         if decoder_config is not None:
             decoder_defaults.update(decoder_config)
