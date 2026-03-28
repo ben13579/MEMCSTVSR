@@ -17,5 +17,6 @@ accelerate launch --num_processes 1 examples/wanvideo/model_training/train.py \
   --trainable_models "dit" \
   --use_gradient_checkpointing \
   --save_steps 1000 \
-  --validation_steps 500 \
+  --validation_steps 1000 \
   --batch_size 1 \
+  --rope_method "base"

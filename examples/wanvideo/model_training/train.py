@@ -2,7 +2,7 @@ import json
 import torch, os, argparse, accelerate, warnings
 import numpy as np
 from tqdm import tqdm
-from diffsynth.core import STVSRDataset
+from diffsynth.core import STVSRDataset, load_state_dict
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -11,6 +11,131 @@ from accelerate import Accelerator
 import random
 from accelerate.utils import set_seed
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def parse_rope_base_grid_args(args):
+    values = (args.rope_base_grid_f, args.rope_base_grid_h, args.rope_base_grid_w)
+    if all(v is None for v in values):
+        return None
+    if any(v is None for v in values):
+        raise ValueError("Please provide all of --rope_base_grid_f, --rope_base_grid_h, and --rope_base_grid_w together.")
+    return tuple(int(v) for v in values)
+
+
+class TrainingProgress:
+    def __init__(self):
+        self.global_step = 0
+        self.epoch_id = 0
+
+    def state_dict(self):
+        return {
+            "global_step": self.global_step,
+            "epoch_id": self.epoch_id,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.global_step = int(state_dict.get("global_step", 0))
+        self.epoch_id = int(state_dict.get("epoch_id", 0))
+
+
+def get_training_state_root(output_path):
+    return os.path.join(output_path, "training_state")
+
+
+def parse_checkpoint_name(name):
+    if name.startswith("step-"):
+        return ("step", int(name.split("-", 1)[1]))
+    if name.startswith("epoch-"):
+        return ("epoch", int(name.split("-", 1)[1]))
+    return None
+
+
+def resolve_resume_checkpoint_path(output_path, resume_from_checkpoint):
+    if resume_from_checkpoint is None:
+        return None
+    if resume_from_checkpoint != "latest":
+        if not os.path.exists(resume_from_checkpoint):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_from_checkpoint}")
+        return resume_from_checkpoint
+
+    checkpoint_root = get_training_state_root(output_path)
+    if not os.path.isdir(checkpoint_root):
+        raise FileNotFoundError(f"No training_state directory found under: {output_path}")
+
+    candidates = []
+    for name in os.listdir(checkpoint_root):
+        path = os.path.join(checkpoint_root, name)
+        parsed = parse_checkpoint_name(name)
+        if parsed is None or not os.path.isdir(path):
+            continue
+        kind, value = parsed
+        kind_order = 1 if kind == "step" else 0
+        candidates.append((value, kind_order, path))
+
+    if not candidates:
+        raise FileNotFoundError(f"No resumable checkpoint found under: {checkpoint_root}")
+
+    candidates.sort()
+    return candidates[-1][2]
+
+
+def save_full_training_state(accelerator, output_path, tag):
+    accelerator.wait_for_everyone()
+    accelerator.save_state(os.path.join(get_training_state_root(output_path), tag))
+
+
+def skip_batches_for_resume(dataloader, steps_to_skip):
+    if steps_to_skip <= 0:
+        return dataloader
+    if hasattr(accelerate, "skip_first_batches"):
+        return accelerate.skip_first_batches(dataloader, steps_to_skip)
+    iterator = iter(dataloader)
+    for _ in range(steps_to_skip):
+        next(iterator, None)
+    return iterator
+
+
+def load_training_state_if_needed(accelerator, model, model_logger, progress, args):
+    resume_path = resolve_resume_checkpoint_path(args.output_path, getattr(args, "resume_from_checkpoint", None))
+    if resume_path is not None:
+        if os.path.isdir(resume_path):
+            accelerator.load_state(resume_path)
+            if accelerator.is_main_process:
+                print(
+                    f"[Resume] loaded checkpoint={resume_path}, "
+                    f"epoch={progress.epoch_id}, step_in_epoch={progress.step_in_epoch}, global_step={progress.global_step}"
+                )
+        else:
+            state_dict = load_state_dict(resume_path, device="cpu")
+            prefix = getattr(args, "remove_prefix_in_ckpt", None)
+            if prefix is not None and prefix != "":
+                state_dict = {prefix + name: value for name, value in state_dict.items()}
+            load_result = accelerator.unwrap_model(model).load_state_dict(state_dict, strict=False)
+            if accelerator.is_main_process:
+                print(
+                    f"[Resume] loaded weights only from {resume_path}; "
+                    "optimizer/scheduler/step will restart from 0"
+                )
+                if len(load_result.unexpected_keys) > 0:
+                    print(f"[Resume] unexpected keys: {load_result.unexpected_keys}")
+                if len(load_result.missing_keys) > 0:
+                    if len(load_result.missing_keys) > 10:
+                        print(f"[Resume] missing keys: {load_result.missing_keys[:10]} ... and {len(load_result.missing_keys) - 10} more")
+                    else:
+                        print(f"[Resume] missing keys: {load_result.missing_keys}")
+    model_logger.num_steps = progress.global_step
+    return progress.global_step
+
+
+def save_step_checkpoint(accelerator, model, model_logger, progress, output_path):
+    model_logger.num_steps = progress.global_step
+    model_logger.save_model(accelerator, model, f"step-{progress.global_step}.safetensors")
+    save_full_training_state(accelerator, output_path, f"step-{progress.global_step}")
+
+
+def save_epoch_checkpoint(accelerator, model, model_logger, progress, output_path, epoch_id):
+    model_logger.on_epoch_end(accelerator, model, epoch_id)
+    save_full_training_state(accelerator, output_path, f"epoch-{epoch_id}")
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -31,6 +156,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
         rope_mode="3d",
+        rope_method="base",
+        rope_dype=False,
+        rope_theta=10000.0,
+        rope_base_grid=None,
     ):
         super().__init__()
         # Warning
@@ -41,9 +170,21 @@ class WanTrainingModule(DiffusionTrainingModule):
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
-        audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config, rope_mode=rope_mode)
+        # audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            rope_mode=rope_mode,
+            rope_method=rope_method,
+            rope_dype=rope_dype,
+            rope_theta=rope_theta,
+            rope_base_grid=rope_base_grid,
+        )
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
+        for name, param in self.pipe.vae.model.encoder.named_parameters():
+            print(name, param.shape)
         
         # Training mode
         self.switch_pipe_to_training_mode(
@@ -69,7 +210,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
-        
+               
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
             if extra_input == "input_image":
@@ -94,6 +235,10 @@ class WanTrainingModule(DiffusionTrainingModule):
             "width": data["GT"][0].size[0],
             "num_frames": len(data["GT"]),
             "rope_mode": self.pipe.rope_mode if hasattr(self.pipe, "rope_mode") else "3d",
+            "rope_method": self.pipe.rope_method if hasattr(self.pipe, "rope_method") else "base",
+            "rope_dype": self.pipe.rope_dype if hasattr(self.pipe, "rope_dype") else False,
+            "rope_theta": self.pipe.rope_theta if hasattr(self.pipe, "rope_theta") else 10000.0,
+            "rope_base_grid": self.pipe.rope_base_grid if hasattr(self.pipe, "rope_base_grid") else None,
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -356,10 +501,11 @@ def launch_training_task_with_validation(
         generator=g,
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-
-    global_step = 0
+    progress = TrainingProgress()
+    accelerator.register_for_checkpointing(progress)
+    global_step = load_training_state_if_needed(accelerator, model, model_logger, progress, args)
     best_loss = float("inf")
-    for epoch_id in range(num_epochs):
+    for epoch_id in range(progress.epoch_id, num_epochs):
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
@@ -375,7 +521,11 @@ def launch_training_task_with_validation(
                 accelerator.backward(loss)
                 optimizer.step()
                 global_step += 1
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                progress.global_step = global_step
+                progress.epoch_id = epoch_id
+                model_logger.num_steps = global_step
+                if save_steps is not None and global_step % save_steps == 0:
+                    save_step_checkpoint(accelerator, model, model_logger, progress, args.output_path)
                 scheduler.step()
 
                 if (
@@ -391,9 +541,12 @@ def launch_training_task_with_validation(
                 #     if accelerator.is_main_process:
                 #         model_logger.save_model(accelerator, model, "best_loss.safetensors")
 
+        progress.epoch_id = epoch_id + 1
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            save_epoch_checkpoint(accelerator, model, model_logger, progress, args.output_path, epoch_id)
+    if save_steps is not None and global_step % save_steps != 0:
+        model_logger.on_training_end(accelerator, model, save_steps)
+        save_step_checkpoint(accelerator, model, model_logger, progress, args.output_path)
 
 
 if __name__ == "__main__":
@@ -430,6 +583,7 @@ if __name__ == "__main__":
             repeat=1,
         )
     model = WanTrainingModule(
+        rope_base_grid=parse_rope_base_grid_args(args),
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
@@ -451,6 +605,9 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
         rope_mode=args.rope_mode,
+        rope_method=args.rope_method,
+        rope_dype=args.rope_dype,
+        rope_theta=args.rope_theta,
     )
     model_logger = ModelLogger(
         args.output_path,

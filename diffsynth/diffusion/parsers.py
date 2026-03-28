@@ -10,10 +10,16 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
     return parser
 
 def add_stvsr_dataset_config(parser: argparse.ArgumentParser):
-    parser.add_argument("--space_scale", type=int, default=4, help="Space scale for STVSR dataset, e.g., 4x. If provided, this will override the height and width config.")
-    parser.add_argument("--time_scale", type=int, default=8, help="Time scale for STVSR dataset, e.g., 4x. If provided, this will override the num_frames config.")
+    parser.add_argument("--space_scale", type=float, default=4, help="Space scale for STVSR dataset, e.g., 4x. If provided, this will override the height and width config.")
+    parser.add_argument("--time_scale", type=float, default=8, help="Time scale for STVSR dataset, e.g., 4x. If provided, this will override the num_frames config.")
     parser.add_argument("--downsample_indexes", type=str, default="0,1,-2,-1", help="Indexes of frames to be downsampled in the STVSR dataset. Comma-separated. Supports negative indexing.")
     parser.add_argument("--rope_mode", type=str, default="3d", choices=["3d", "4d"], help="ROPE mode for STVSR dataset. Supported options: '3d', '4d'.")
+    parser.add_argument("--rope_method", type=str, default="base", choices=["base", "yarn"], help="RoPE frequency generation method for STVSR. Supported options: 'base' and 'yarn'.")
+    parser.add_argument("--rope_dype", default=False, action=argparse.BooleanOptionalAction, help="Enable DyPE timestep-aware modulation for YaRN RoPE.")
+    parser.add_argument("--rope_theta", type=float, default=10000.0, help="Base theta used when building dynamic 3D RoPE frequencies.")
+    parser.add_argument("--rope_base_grid_f", type=int, default=None, help="Optional base temporal patch grid used by dynamic 3D RoPE.")
+    parser.add_argument("--rope_base_grid_h", type=int, default=None, help="Optional base height patch grid used by dynamic 3D RoPE.")
+    parser.add_argument("--rope_base_grid_w", type=int, default=None, help="Optional base width patch grid used by dynamic 3D RoPE.")
     return parser
 
 def add_image_size_config(parser: argparse.ArgumentParser):
@@ -52,6 +58,7 @@ def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume training from a full training-state checkpoint directory, or use `latest`.")
     return parser
 
 def add_lora_config(parser: argparse.ArgumentParser):

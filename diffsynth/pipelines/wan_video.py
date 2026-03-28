@@ -1,3 +1,4 @@
+import math
 import torch, types
 import numpy as np
 from PIL import Image
@@ -84,6 +85,10 @@ class WanVideoPipeline(BasePipeline):
         self.model_fn = model_fn_wan_video
 
         self.rope_mode = "3d"
+        self.rope_method: Literal["base", "yarn"] = "base"
+        self.rope_dype = False
+        self.rope_theta = 10000.0
+        self.rope_base_grid: Optional[tuple[int, int, int]] = None
 
 
     def enable_usp(self):
@@ -111,6 +116,10 @@ class WanVideoPipeline(BasePipeline):
         use_usp: bool = False,
         vram_limit: float = None,
         rope_mode: str = "3d",
+        rope_method: Literal["base", "yarn"] = "base",
+        rope_dype: bool = False,
+        rope_theta: float = 10000.0,
+        rope_base_grid: Optional[tuple[int, int, int]] = None,
     ):
         # Redirect model path
         if redirect_common_files:
@@ -179,6 +188,10 @@ class WanVideoPipeline(BasePipeline):
 
         # ROPE precompute
         pipe.rope_mode = rope_mode
+        pipe.rope_method = rope_method
+        pipe.rope_dype = rope_dype
+        pipe.rope_theta = rope_theta
+        pipe.rope_base_grid = rope_base_grid
         return pipe
 
 
@@ -239,6 +252,11 @@ class WanVideoPipeline(BasePipeline):
         # Scheduler
         num_inference_steps: Optional[int] = 50,
         sigma_shift: Optional[float] = 5.0,
+        rope_mode: Optional[str] = None,
+        rope_method: Optional[Literal["base", "yarn"]] = None,
+        rope_dype: Optional[bool] = None,
+        rope_theta: Optional[float] = None,
+        rope_base_grid: Optional[tuple[int, int, int]] = None,
         # Speed control
         motion_bucket_id: Optional[int] = None,
         # LongCat-Video
@@ -257,6 +275,12 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         output_type: Optional[Literal["quantized", "floatpoint"]] = "quantized",
     ):
+        rope_mode = self.rope_mode if rope_mode is None else rope_mode
+        rope_method = self.rope_method if rope_method is None else rope_method
+        rope_dype = self.rope_dype if rope_dype is None else rope_dype
+        rope_theta = self.rope_theta if rope_theta is None else rope_theta
+        rope_base_grid = self.rope_base_grid if rope_base_grid is None else rope_base_grid
+
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
@@ -282,6 +306,7 @@ class WanVideoPipeline(BasePipeline):
             "height": height, "width": width, "num_frames": num_frames,
             "cfg_scale": cfg_scale, "cfg_merge": cfg_merge,
             "sigma_shift": sigma_shift,
+            "rope_mode": rope_mode, "rope_method": rope_method, "rope_dype": rope_dype, "rope_theta": rope_theta, "rope_base_grid": rope_base_grid,
             "motion_bucket_id": motion_bucket_id,
             "longcat_video": longcat_video,
             "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
@@ -380,6 +405,8 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
             length += f
         shape = (1, pipe.vae.model.z_dim, length, height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor)
         noise = pipe.generate_noise(shape, seed=seed, rand_device=rand_device)
+        # noise = noise.to(dtype=pipe.torch_dtype, device=pipe.device)
+        # noise = torch.randn(shape, device=rand_device, dtype=pipe.torch_dtype)
         # noise = torch.load("noise.pt", map_location="cpu").to(device=pipe.device,dtype=pipe.torch_dtype) 
         if vace_reference_image is not None:
             noise = torch.concat((noise[:, :, -f:], noise[:, :, :-f]), dim=2)
@@ -1210,6 +1237,179 @@ class TemporalTiler_BCTHW:
 
 
 
+def find_correction_factor(num_rotations, dim, base, max_position_embeddings):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+
+def find_correction_range(low_ratio, high_ratio, dim, base, ori_max_pe_len):
+    low = np.floor(find_correction_factor(low_ratio, dim, base, ori_max_pe_len))
+    high = np.ceil(find_correction_factor(high_ratio, dim, base, ori_max_pe_len))
+    return max(low, 0), min(high, dim - 1)
+
+
+def linear_ramp_mask(min_v, max_v, dim):
+    if min_v == max_v:
+        max_v += 1e-3
+    t = (torch.arange(dim, dtype=torch.float64) - min_v) / (max_v - min_v)
+    return torch.clamp(t, 0, 1)
+
+
+def find_newbase_ntk(dim, base, scale):
+    return base * (scale ** (dim / (dim - 2)))
+
+
+def rope_params_yarn_dype(
+    max_seq_len: int,
+    dim: int,
+    theta: float = 10000.0,
+    *,
+    yarn: bool = True,
+    ori_max_pe_len: int = 64,
+    max_pe_len: int = 64,
+    dype: bool = True,
+    current_timestep: float = 1.0,
+    device=None,
+):
+    assert dim % 2 == 0
+    if device is None:
+        device = torch.device("cpu")
+
+    pos = torch.arange(max_seq_len, device=device, dtype=torch.float64)
+    half = dim // 2
+    idx = torch.arange(half, device=device, dtype=torch.float64)
+    freqs_base_1d = 1.0 / torch.pow(theta, (2.0 * idx) / dim)
+
+    if (not yarn) or (max_pe_len <= ori_max_pe_len):
+        angles = torch.outer(pos, freqs_base_1d)
+        return torch.polar(torch.ones_like(angles), angles)
+
+    scale = max(1.0, float(max_pe_len) / float(ori_max_pe_len))
+    scale_t = torch.tensor(scale, dtype=torch.float64, device=device)
+
+    freqs_linear_1d = freqs_base_1d / scale_t
+    new_base = find_newbase_ntk(dim, theta, scale_t)
+    freqs_ntk_1d = 1.0 / torch.pow(new_base, (2.0 * idx) / dim)
+
+    beta_0, beta_1 = 1.25, 0.75
+    gamma_0, gamma_1 = 16.0, 2.0
+
+    if dype:
+        t = float(current_timestep)
+        expo = 2.0 * (t ** 2.0)
+        beta_0 = beta_0 ** expo
+        beta_1 = beta_1 ** expo
+        gamma_0 = gamma_0 ** expo
+        gamma_1 = gamma_1 ** expo
+
+    low, high = find_correction_range(beta_0, beta_1, dim, theta, ori_max_pe_len)
+    low = max(0, int(low))
+    high = min(half, int(high))
+    mask = 1.0 - linear_ramp_mask(low, high, half).to(device)
+    freqs_1d = freqs_linear_1d * (1.0 - mask) + freqs_ntk_1d * mask
+
+    low, high = find_correction_range(gamma_0, gamma_1, dim, theta, ori_max_pe_len)
+    low = max(0, int(low))
+    high = min(half, int(high))
+    mask2 = 1.0 - linear_ramp_mask(low, high, half).to(device)
+    freqs_1d = freqs_1d * (1.0 - mask2) + freqs_base_1d * mask2
+
+    angles = torch.outer(pos, freqs_1d)
+    freqs_complex = torch.polar(torch.ones_like(angles), angles)
+    mscale = 0.1 * math.log(scale) + 1.0
+    return freqs_complex * mscale
+
+
+def normalize_timestep_for_dype(timestep) -> float:
+    if timestep is None:
+        return 1.0
+    if torch.is_tensor(timestep):
+        if timestep.numel() == 0:
+            return 1.0
+        timestep_scalar = float(timestep.detach().flatten()[0].item())
+    else:
+        timestep_scalar = float(timestep)
+    return max(0.0, min(1.0, timestep_scalar / 1000.0))
+
+
+def resolve_rope_base_grid(rope_base_grid, default_grid):
+    base_grid = default_grid if rope_base_grid is None else rope_base_grid
+    if base_grid is None or len(base_grid) != 3:
+        raise ValueError(f"rope_base_grid must be a 3-tuple/list in patch units, got {base_grid}.")
+    base_grid = tuple(int(v) for v in base_grid)
+    if any(v <= 0 for v in base_grid):
+        raise ValueError(f"rope_base_grid must contain positive patch sizes, got {base_grid}.")
+    return base_grid
+
+
+def build_dynamic_rope_freqs_3d(
+    dim: int,
+    num_heads: int,
+    requested_grid: tuple[int, int, int],
+    *,
+    rope_method: Literal["base", "yarn"],
+    rope_dype: bool,
+    rope_theta: float,
+    rope_base_grid: Optional[tuple[int, int, int]],
+    default_base_grid: tuple[int, int, int],
+    t_norm: float,
+    device: torch.device,
+):
+    if rope_method not in ("base", "yarn"):
+        raise ValueError(f"Unsupported rope_method: {rope_method}. Expected 'base' or 'yarn'.")
+
+    base_f, base_h, base_w = resolve_rope_base_grid(rope_base_grid, default_base_grid)
+    req_f, req_h, req_w = (int(requested_grid[0]), int(requested_grid[1]), int(requested_grid[2]))
+    print("Requested RoPE grid:", (req_f, req_h, req_w), "Base RoPE grid:", (base_f, base_h, base_w))
+    max_f = max(req_f, base_f)
+    max_h = max(req_h, base_h)
+    max_w = max(req_w, base_w)
+    max_len = max(max_f, max_h, max_w, 1)
+    if max_len > 1024:
+        raise ValueError(f"Dynamic 3D RoPE currently supports axis lengths up to 1024, got requested max length {max_len}.")
+
+    head_dim = dim // num_heads
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE expects an even head_dim, got dim={dim}, num_heads={num_heads}, head_dim={head_dim}.")
+
+    complex_dim = head_dim // 2
+    c_f = complex_dim - 2 * (complex_dim // 3)
+    c_h = complex_dim // 3
+    c_w = complex_dim // 3
+
+    def build_axis(axis_max_len, axis_dim_real, ori_max_pe_len):
+        return rope_params_yarn_dype(
+            max_seq_len=max_len,
+            dim=int(axis_dim_real),
+            theta=rope_theta,
+            yarn=(rope_method == "yarn"),
+            ori_max_pe_len=int(ori_max_pe_len),
+            max_pe_len=int(axis_max_len),
+            dype=rope_dype,
+            current_timestep=float(t_norm),
+            device=device,
+        ).to(device)
+
+    freqs_f = build_axis(max_f, c_f * 2, base_f)
+    freqs_h = build_axis(max_h, c_h * 2, base_h)
+    freqs_w = build_axis(max_w, c_w * 2, base_w)
+    return torch.cat([freqs_f, freqs_h, freqs_w], dim=1)
+
+
+def build_token_freqs_3d(grid: tuple[int, int, int], freqs, device: torch.device):
+    f, h, w = (int(grid[0]), int(grid[1]), int(grid[2]))
+    if isinstance(freqs, (list, tuple)):
+        freq_f, freq_h, freq_w = freqs
+    else:
+        complex_dim = freqs.shape[1]
+        split_sizes = [complex_dim - 2 * (complex_dim // 3), complex_dim // 3, complex_dim // 3]
+        freq_f, freq_h, freq_w = freqs.split(split_sizes, dim=1)
+    return torch.cat([
+        freq_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freq_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freq_w[:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(device)
+
+
 def build_mixed_grid_sizes(main_grid, lq_grid, batch_size, device):
     main_f, main_h, main_w = main_grid
     lq_f, lq_h, lq_w = lq_grid
@@ -1639,6 +1839,10 @@ def model_fn_wan_video(
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
     rope_mode: str = "3d",
+    rope_method: Literal["base", "yarn"] = "base",
+    rope_dype: bool = False,
+    rope_theta: float = 10000.0,
+    rope_base_grid: Optional[tuple[int, int, int]] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1659,6 +1863,10 @@ def model_fn_wan_video(
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
             rope_mode=rope_mode,
+            rope_method=rope_method,
+            rope_dype=rope_dype,
+            rope_theta=rope_theta,
+            rope_base_grid=rope_base_grid,
         )
         return TemporalTiler_BCTHW().run(
             model_fn_wan_video,
@@ -1701,6 +1909,13 @@ def model_fn_wan_video(
         from xfuser.core.distributed import (get_sequence_parallel_rank,
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
+
+    if rope_method not in ("base", "yarn"):
+        raise ValueError(f"Unsupported rope_method: {rope_method}. Expected 'base' or 'yarn'.")
+    if rope_mode == "4d" and (rope_method != "base" or rope_dype):
+        raise ValueError("DyPE/YaRN RoPE currently supports only rope_mode='3d'. Please use rope_method='base' and rope_dype=False for 4D RoPE.")
+    rope_timestep = timestep
+    t_norm = normalize_timestep_for_dype(rope_timestep)
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
@@ -1774,8 +1989,22 @@ def model_fn_wan_video(
         x_lq = rearrange(x_lq, 'b c f h w -> b (f h w) c').contiguous()
         x = torch.concat([x, x_lq], dim=1)
         if rope_mode == "3d":
+            freqs_src = dit.freqs
+            if rope_method != "base":
+                freqs_src = build_dynamic_rope_freqs_3d(
+                    dim=dit.dim,
+                    num_heads=dit.num_heads,
+                    requested_grid=(max(f + 2, f_lq), max(h, h_lq), max(w, w_lq)),
+                    rope_method=rope_method,
+                    rope_dype=rope_dype,
+                    rope_theta=rope_theta,
+                    rope_base_grid=rope_base_grid,
+                    default_base_grid=(f, h, w),
+                    t_norm=t_norm,
+                    device=x.device,
+                )
             mixed_grid_sizes = build_mixed_grid_sizes((f, h, w), (f_lq, h_lq, w_lq), x.shape[0], x.device)
-            freqs = compute_mixed_rope(x, mixed_grid_sizes, dit.freqs, dit.num_heads, dit.dim)
+            freqs = compute_mixed_rope(x, mixed_grid_sizes, freqs_src, dit.num_heads, dit.dim)
         else:
             # Backward-compatible arg retention: sample-id stride is ignored in segment-id 4D mode.
             mixed_grid_sizes_4d = build_mixed_grid_sizes_4d(
@@ -1788,11 +2017,21 @@ def model_fn_wan_video(
             freqs_4d = build_freqs_4d(dit.freqs, c=c, device=x.device)
             freqs = compute_mixed_rope_4d(x, mixed_grid_sizes_4d, freqs_4d, dit.num_heads, dit.dim)
     else:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs_src = dit.freqs
+        if rope_method != "base":
+            freqs_src = build_dynamic_rope_freqs_3d(
+                dim=dit.dim,
+                num_heads=dit.num_heads,
+                requested_grid=(f, h, w),
+                rope_method=rope_method,
+                rope_dype=rope_dype,
+                rope_theta=rope_theta,
+                rope_base_grid=rope_base_grid,
+                default_base_grid=(f, h, w),
+                t_norm=t_norm,
+                device=x.device,
+            )
+        freqs = build_token_freqs_3d((f, h, w), freqs_src, x.device)
 
     # VAP 
     if vap is not None:

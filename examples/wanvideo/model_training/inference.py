@@ -9,12 +9,22 @@ from tqdm import tqdm
 
 from diffsynth.core import STVSRDataset, load_state_dict
 from diffsynth.core.data.operators import LoadAudio, LoadVideo, ImageCropAndResize, ToAbsolutePath
+from diffsynth.core.data.stvsr_dataset import OODDataset
 from diffsynth.diffusion import DiffusionTrainingModule
 from diffsynth.diffusion.parsers import add_general_config, add_video_size_config
 from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
 from diffsynth.utils.data import save_video
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def parse_rope_base_grid_args(args):
+    values = (args.rope_base_grid_f, args.rope_base_grid_h, args.rope_base_grid_w)
+    if all(v is None for v in values):
+        return None
+    if any(v is None for v in values):
+        raise ValueError("Please provide all of --rope_base_grid_f, --rope_base_grid_h, and --rope_base_grid_w together.")
+    return tuple(int(v) for v in values)
 
 
 def wan_inference_parser():
@@ -28,7 +38,7 @@ def wan_inference_parser():
     # Model load
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to audio processor.")
-    parser.add_argument("--dit_checkpoint", type=str, required=True, help="Path to full DiT checkpoint.")
+    # parser.add_argument("--dit_checkpoint", type=str, required=True, help="Path to full DiT checkpoint.")
     parser.add_argument("--dit_checkpoint_strict", action="store_true", help="Load DiT checkpoint with strict=True.")
     parser.add_argument("--device", type=str, default=None, help="Inference device. Default: cuda if available else cpu.")
     parser.add_argument(
@@ -103,6 +113,22 @@ def build_stvsr_dataset_for_inference(
             width_division_factor=16,
         ),
     )
+    # return OODDataset(
+    #         base_path=base_path,
+    #         metadata_path=metadata_path,
+    #         repeat=repeat,
+    #         data_file_keys=data_file_keys.split(","),
+    #         space_scale=args.space_scale,
+    #         time_scale=args.time_scale,
+    #         main_data_operator=OODDataset.load_clip_operators(
+    #             base_path=base_path,
+    #             max_pixels=args.max_pixels,
+    #             height=args.height,
+    #             width=args.width,
+    #             height_division_factor=16,
+    #             width_division_factor=16,
+    #         ),
+    #     )
 
 
 def frame_to_float_np(frame):
@@ -182,33 +208,32 @@ def build_pipeline(args):
     if args.tokenizer_path is not None:
         tokenizer_config = ModelConfig(args.tokenizer_path)
 
-    audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/")
-    if args.audio_processor_path is not None:
-        audio_processor_config = ModelConfig(args.audio_processor_path)
-
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=parse_torch_dtype(args.torch_dtype),
         device=args.device,
         model_configs=model_configs,
         tokenizer_config=tokenizer_config,
-        audio_processor_config=audio_processor_config,
         rope_mode=args.rope_mode,
+        rope_method=args.rope_method,
+        rope_dype=args.rope_dype,
+        rope_theta=args.rope_theta,
+        rope_base_grid=parse_rope_base_grid_args(args),
     )
 
-    if not os.path.exists(args.dit_checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.dit_checkpoint}")
-    state_dict = load_state_dict(args.dit_checkpoint, device="cpu")
-    load_result = pipe.dit.load_state_dict(state_dict, strict=args.dit_checkpoint_strict)
-    missing_keys, unexpected_keys = load_result
-    print(
-        "[Checkpoint] loaded:",
-        args.dit_checkpoint,
-        f"strict={args.dit_checkpoint_strict}, missing={len(missing_keys)}, unexpected={len(unexpected_keys)}",
-    )
-    if missing_keys:
-        print("[Checkpoint] missing_keys (first 20):", missing_keys[:20])
-    if unexpected_keys:
-        print("[Checkpoint] unexpected_keys (first 20):", unexpected_keys[:20])
+    # if not os.path.exists(args.dit_checkpoint):
+    #     raise FileNotFoundError(f"Checkpoint not found: {args.dit_checkpoint}")
+    # state_dict = load_state_dict(args.dit_checkpoint, device="cpu")
+    # load_result = pipe.dit.load_state_dict(state_dict, strict=args.dit_checkpoint_strict)
+    # missing_keys, unexpected_keys = load_result
+    # print(
+    #     "[Checkpoint] loaded:",
+    #     args.dit_checkpoint,
+    #     f"strict={args.dit_checkpoint_strict}, missing={len(missing_keys)}, unexpected={len(unexpected_keys)}",
+    # )
+    # if missing_keys:
+    #     print("[Checkpoint] missing_keys (first 20):", missing_keys[:20])
+    # if unexpected_keys:
+    #     print("[Checkpoint] unexpected_keys (first 20):", unexpected_keys[:20])
     return pipe
 
 
@@ -252,8 +277,8 @@ def run_inference_loop(args, dataset, pipe):
             record = {
                 "sample_id": idx,
                 "prompt": "",
-                # "seed": args.seed + (idx - start_index) * args.seed_stride,
-                "seed": args.seed,
+                "seed": args.seed + (idx - start_index) * args.seed_stride,
+                # "seed": args.seed,
                 "pred_path": None,
                 "gt_path": None,
                 "lq_path": None,
@@ -286,6 +311,7 @@ def run_inference_loop(args, dataset, pipe):
                     height=gt_video[0].size[1],
                     width=gt_video[0].size[0],
                     num_frames=len(gt_video),
+                    # num_frames=9,
                     cfg_scale=args.cfg_scale,
                     num_inference_steps=args.num_inference_steps,
                     sigma_shift=args.sigma_shift,
